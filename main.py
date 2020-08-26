@@ -36,6 +36,14 @@ def parse_args():
     parser.add_argument('--benchmark_flag', type=str2bool, default=False)
     parser.add_argument('--resume', type=str2bool, default=False)
 
+    parser.add_argument('--mel_spectrogram', type=str2bool, default=False, help='Input mel spectrograms instead of images')
+    parser.add_argument('--print_input', type=str2bool, default=False, help='Print stats about inputs')
+    parser.add_argument('--print_wandg', type=str2bool, default=False, help='Print stats about weights and gradients')
+    parser.add_argument('--gen_lr', type=float, required=False, help='Learning rate for generator')
+    parser.add_argument('--dis_lr', type=float, required=False, help='Learning rate for discriminator')
+    parser.add_argument('--print_gen_layer', type=int, default=-1, help='Print parameters at specified index for generators')
+    parser.add_argument('--print_dis_layer', type=int, default=-1, help='Print parameters at specified index for discriminators')
+
     return check_args(parser.parse_args())
 
 """checking arguments"""

@@ -1,3 +1,4 @@
+import torch
 import torch.utils.data as data
 
 from PIL import Image
@@ -103,6 +104,19 @@ class ImageFolder(DatasetFolder):
     def __init__(self, root, transform=None, target_transform=None,
                  loader=default_loader):
         super(ImageFolder, self).__init__(root, loader, IMG_EXTENSIONS,
+                                          transform=transform,
+                                          target_transform=target_transform)
+        self.imgs = self.samples
+
+
+def default_mel_loader(path):
+    return torch.load(path)
+
+
+class MelFolder(DatasetFolder):
+    def __init__(self, root, transform=None, target_transform=None,
+                 loader=default_mel_loader):
+        super(MelFolder, self).__init__(root, loader, ['.mel'],
                                           transform=transform,
                                           target_transform=target_transform)
         self.imgs = self.samples
