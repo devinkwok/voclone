@@ -37,12 +37,24 @@ def parse_args():
     parser.add_argument('--resume', type=str2bool, default=False)
 
     parser.add_argument('--mel_spectrogram', type=str2bool, default=False, help='Input mel spectrograms instead of images')
-    parser.add_argument('--print_input', type=str2bool, default=False, help='Print stats about inputs')
-    parser.add_argument('--print_wandg', type=str2bool, default=False, help='Print stats about weights and gradients')
     parser.add_argument('--gen_lr', type=float, required=False, help='Learning rate for generator')
     parser.add_argument('--dis_lr', type=float, required=False, help='Learning rate for discriminator')
+
+    parser.add_argument('--use_noise', type=str2bool, default=False, help='Use noise data in DATASET/noise')
+    parser.add_argument('--gen_noise_A', type=float, default=0., help='Proportion of noise to add to A samples before generation')
+    parser.add_argument('--gen_noise_B', type=float, default=0., help='Proportion of noise to add to B samples before generation')
+    parser.add_argument('--dis_noise_A', type=float, default=0., help='Proportion of noise to add to A2B samples after generation, before discriminator')
+    parser.add_argument('--dis_noise_B', type=float, default=0., help='Proportion of noise to add to B2A samples after generation, before discriminator')
+    parser.add_argument('--identity_noise_A', type=float, default=0., help='Proportion of noise to add to identity loss A2A')
+    parser.add_argument('--identity_noise_B', type=float, default=0., help='Proportion of noise to add to identity loss B2B')
+    parser.add_argument('--cycle_noise_A', type=float, default=0., help='Proportion of noise to add to cycle loss A2B2A')
+    parser.add_argument('--cycle_noise_B', type=float, default=0., help='Proportion of noise to add to cycle loss B2A2B')
+
+    parser.add_argument('--print_input', type=str2bool, default=False, help='Print stats about inputs')
+    parser.add_argument('--print_wandg', type=str2bool, default=False, help='Print stats about weights and gradients')
     parser.add_argument('--print_gen_layer', type=int, default=-1, help='Print parameters at specified index for generators')
     parser.add_argument('--print_dis_layer', type=int, default=-1, help='Print parameters at specified index for discriminators')
+    parser.add_argument('--save_when_interrupted', type=str2bool, default=False, help='Save model when early termination occurs')
 
     return check_args(parser.parse_args())
 
@@ -72,6 +84,7 @@ def main():
     args = parse_args()
     if args is None:
       exit()
+    print(args)
 
     # open session
     gan = UGATIT(args)
@@ -79,13 +92,20 @@ def main():
     # build graph
     gan.build_model()
 
-    if args.phase == 'train' :
-        gan.train()
-        print(" [*] Training finished!")
+    try:  # this try/catch is for early stopping program via keyboard interrupt
+        if args.phase == 'train' :
+            gan.train()
+            print(" [*] Training finished!")
 
-    if args.phase == 'test' :
-        gan.test()
-        print(" [*] Test finished!")
+        if args.phase == 'test' :
+            gan.test()
+            print(" [*] Test finished!")
+
+    except (KeyboardInterrupt, SystemExit):
+        print('Interrupted')
+        if args.save_when_interrupted:
+            print('Trying to save checkpoint...')
+            gan.save(os.path.join(args.result_dir, 'model'), 'interrupted')
 
 if __name__ == '__main__':
     main()
