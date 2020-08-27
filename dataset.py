@@ -1,5 +1,7 @@
+from math import ceil
 import torch
 import torch.utils.data as data
+import torch.nn.functional as F
 
 from PIL import Image
 
@@ -120,3 +122,28 @@ class MelFolder(DatasetFolder):
                                           transform=transform,
                                           target_transform=target_transform)
         self.imgs = self.samples
+
+
+class SequentialMelLoader():
+    def __init__(self, dataset, width, stride=None):
+        self.dataset = iter(dataset)
+        self.width = width
+        if stride is None:
+            self.stride = self.width // 2
+        else:
+            self.stride = stride
+
+    def generate_samples(self):
+        for mel, _ in self.dataset:
+            mel = mel.unsqueeze(0)
+            usable_len = mel.shape[3] - self.width
+            n_iters = ceil(usable_len / self.stride)
+            target_len = n_iters * self.stride
+            # pad so that stride divides length - width evenly
+            mel = F.pad(mel, pad=(0, target_len - usable_len), mode='constant', value=0)
+            # need to add 1 to self.width to include the last iteration
+            for i in range(0, mel.shape[3] - self.width + 1, self.stride):
+                yield mel[:,:,:, i:i + self.width], None
+
+    def __iter__(self):
+        return self.generate_samples()

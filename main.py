@@ -49,6 +49,8 @@ def parse_args():
     parser.add_argument('--identity_noise_B', type=float, default=0., help='Proportion of noise to add to identity loss B2B')
     parser.add_argument('--cycle_noise_A', type=float, default=0., help='Proportion of noise to add to cycle loss A2B2A')
     parser.add_argument('--cycle_noise_B', type=float, default=0., help='Proportion of noise to add to cycle loss B2A2B')
+    parser.add_argument('--test_stride', type=int, default=None, help='Distance to move adjacent windows when generating contiguous audio')
+    parser.add_argument('--test_interpolate', type=str2bool, default=False, help='When generating continuous audio, whether to linearly interpolate between windows or trim and concatenate')
 
     parser.add_argument('--print_input', type=str2bool, default=False, help='Print stats about inputs')
     parser.add_argument('--print_wandg', type=str2bool, default=False, help='Print stats about weights and gradients')

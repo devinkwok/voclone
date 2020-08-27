@@ -1,5 +1,5 @@
 import time, itertools
-from dataset import ImageFolder, MelFolder
+from dataset import ImageFolder, MelFolder, SequentialMelLoader
 from torchvision import transforms
 from torch.utils.data import DataLoader
 from networks import *
@@ -7,12 +7,29 @@ from utils import *
 from glob import glob
 
 
+def crossfade(mel_1, mel_2, overlap, interpolate=False):
+    if mel_1 is None:
+        return mel_2
+    if overlap < 1:
+        return torch.cat((mel_1, mel_2), axis=3)
+    elif interpolate:
+        weights = torch.arange(overlap, dtype=torch.float) / overlap
+        overlap_region = mel_1[:, :, :, -overlap:] * weights + mel_2[:, :, :, :overlap] * torch.flip(weights, [0])
+    else:
+        trim_1 = overlap // 2
+        trim_2 = overlap - trim_1
+        overlap_region = torch.cat((mel_1[:, :, :, -overlap: - trim_1], mel_2[:, :, :, trim_2:overlap]), axis=3)
+    return torch.cat((mel_1[:, :, :, :-overlap], overlap_region, mel_2[:, :, :, overlap:]), axis=3)
+
+
 def mel_transform(mel_spectrogram):
-    return (mel_spectrogram + 11.) / 13. * 2. - 1.
+    mel = (mel_spectrogram + 11.) / 13. * 2. - 1.
+    return mel.unsqueeze(0)
 
 
 def inv_mel_transform(mel_spectrogram):
-    return (mel_spectrogram + 1.) / 2. * 13. - 11.
+    mel = (mel_spectrogram + 1.) / 2. * 13. - 11.
+    return mel.squeeze()
 
 
 def print_and_pass_input(tensor, prefix='', do_print=True):
@@ -66,12 +83,14 @@ def wandg_stats(*modules):
 # adds log-mel spectrograms together at given proportion (transforms first by exp)
 def add_noise(source, noise, noise_prop):
     with torch.no_grad():
-        source_prop = 1. - noise_prop
-        out = torch.log(torch.exp(inv_mel_transform(source)) * source_prop \
-                        + torch.exp(inv_mel_transform(noise)) * noise_prop)
-        torch.save(inv_mel_transform(torch.cat([source.detach().cpu().squeeze(), noise.detach().cpu().squeeze(), out.detach().cpu().squeeze()],
-                    axis=1)), os.path.join('results', 'debug', 'noise-debug.mel'))
-        return mel_transform(out)
+        return mel_transform(torch.log(torch.exp(inv_mel_transform(source)) \
+                        + torch.exp(inv_mel_transform(noise))))
+        # source_prop = 1. - noise_prop
+        # out = torch.log(torch.exp(inv_mel_transform(source)) * source_prop \
+        #                 + torch.exp(inv_mel_transform(noise)) * noise_prop)
+        # torch.save(inv_mel_transform(torch.cat([source.detach().cpu(), noise.detach().cpu(), out.detach().cpu()],
+        #             axis=2)), os.path.join('results', 'debug', 'noise-debug.mel'))
+        # return mel_transform(out)
 
 
 class UGATIT(object) :
@@ -141,6 +160,10 @@ class UGATIT(object) :
         self.identity_noise_B = args.identity_noise_B
         self.cycle_noise_A = args.cycle_noise_A
         self.cycle_noise_B = args.cycle_noise_B
+        self.test_interpolate = args.test_interpolate
+        self.test_stride = args.test_stride
+        if self.test_stride is None:
+            self.test_stride = self.img_size
 
         self.print_gen_layer = args.print_gen_layer
         self.print_dis_layer = args.print_dis_layer
@@ -182,22 +205,21 @@ class UGATIT(object) :
         if self.mel_spectrogram:
             train_transform = transforms.Compose([
                 transforms.Lambda(lambda x: print_and_pass_input(x, prefix='before', do_print=self.print_input)),
-                transforms.Lambda(lambda x: x.unsqueeze(0)),
                 transforms.Lambda(mel_transform),
                 transforms.Lambda(lambda x: random_crop(x, self.img_size)),
                 transforms.Lambda(lambda x: print_and_pass_input(x, prefix='    after', do_print=self.print_input)),
             ])
             test_transform = transforms.Compose([
                 transforms.Lambda(lambda x: print_and_pass_input(x, prefix='before', do_print=self.print_input)),
-                transforms.Lambda(lambda x: x.unsqueeze(0)),
                 transforms.Lambda(mel_transform),
-                transforms.Lambda(lambda x: random_crop(x, self.img_size)),
                 transforms.Lambda(lambda x: print_and_pass_input(x, prefix='    after', do_print=self.print_input)),
             ])
             self.trainA = MelFolder(os.path.join('dataset', self.dataset, 'trainA'), train_transform)
             self.trainB = MelFolder(os.path.join('dataset', self.dataset, 'trainB'), train_transform)
             self.testA = MelFolder(os.path.join('dataset', self.dataset, 'testA'), test_transform)
             self.testB = MelFolder(os.path.join('dataset', self.dataset, 'testB'), test_transform)
+            self.testA_loader = SequentialMelLoader(self.testA, self.img_size, stride=self.test_stride)
+            self.testB_loader = SequentialMelLoader(self.testB, self.img_size, stride=self.test_stride)
             if self.use_noise:
                 self.noise_data = MelFolder(os.path.join('dataset', self.dataset, 'noise'), train_transform)
                 self.noise_loader = DataLoader(self.noise_data, batch_size=self.batch_size, shuffle=True)
@@ -222,11 +244,11 @@ class UGATIT(object) :
             self.trainB = ImageFolder(os.path.join('dataset', self.dataset, 'trainB'), train_transform)
             self.testA = ImageFolder(os.path.join('dataset', self.dataset, 'testA'), test_transform)
             self.testB = ImageFolder(os.path.join('dataset', self.dataset, 'testB'), test_transform)
+            self.testA_loader = DataLoader(self.testA, batch_size=1, shuffle=False)
+            self.testB_loader = DataLoader(self.testB, batch_size=1, shuffle=False)
 
         self.trainA_loader = DataLoader(self.trainA, batch_size=self.batch_size, shuffle=True)
         self.trainB_loader = DataLoader(self.trainB, batch_size=self.batch_size, shuffle=True)
-        self.testA_loader = DataLoader(self.testA, batch_size=1, shuffle=False)
-        self.testB_loader = DataLoader(self.testB, batch_size=1, shuffle=False)
 
         """ Define Generator, Discriminator """
         self.genA2B = ResnetGenerator(input_nc=self.img_ch, output_nc=self.img_ch, ngf=self.ch, n_blocks=self.n_res, img_size=self.img_size, light=self.light).to(self.device)
@@ -273,23 +295,23 @@ class UGATIT(object) :
                 self.D_optim.param_groups[0]['lr'] -= (self.lr / (self.iteration // 2))
 
             try:
-                real_A, _ = trainA_iter.next()
+                real_A, _ = next(trainA_iter)
             except:
                 trainA_iter = iter(self.trainA_loader)
-                real_A, _ = trainA_iter.next()
+                real_A, _ = next(trainA_iter)
 
             try:
-                real_B, _ = trainB_iter.next()
+                real_B, _ = next(trainB_iter)
             except:
                 trainB_iter = iter(self.trainB_loader)
-                real_B, _ = trainB_iter.next()
+                real_B, _ = next(trainB_iter)
 
             if self.use_noise:  # add noise to data samples if required
                 try:
-                    noise, _ = noise_iter.next()
+                    noise, _ = next(noise_iter)
                 except:
                     noise_iter = iter(self.noise_loader)
-                    noise, _ = noise_iter.next()
+                    noise, _ = next(noise_iter)
                 if self.gen_noise_A > 0.:
                     print('gen_real_A', summarize(real_A))
                     real_A = add_noise(real_A, noise, self.gen_noise_A)
@@ -459,8 +481,8 @@ class UGATIT(object) :
                 train_sample_num = 5
                 test_sample_num = 5
                 if self.mel_spectrogram:
-                    A2B = torch.zeros((self.img_size, 0))
-                    B2A = torch.zeros((self.img_size, 0))
+                    A2B = torch.zeros((1, self.img_size, 0))
+                    B2A = torch.zeros((1, self.img_size, 0))
                 else:
                     A2B = np.zeros((self.img_size * 7, 0, self.img_ch))
                     B2A = np.zeros((self.img_size * 7, 0, self.img_ch))
@@ -468,16 +490,16 @@ class UGATIT(object) :
                 self.genA2B.eval(), self.genB2A.eval(), self.disGA.eval(), self.disGB.eval(), self.disLA.eval(), self.disLB.eval()
                 for _ in range(train_sample_num):
                     try:
-                        real_A, _ = trainA_iter.next()
+                        real_A, _ = next(trainA_iter)
                     except:
                         trainA_iter = iter(self.trainA_loader)
-                        real_A, _ = trainA_iter.next()
+                        real_A, _ = next(trainA_iter)
 
                     try:
-                        real_B, _ = trainB_iter.next()
+                        real_B, _ = next(trainB_iter)
                     except:
                         trainB_iter = iter(self.trainB_loader)
-                        real_B, _ = trainB_iter.next()
+                        real_B, _ = next(trainB_iter)
                     real_A, real_B = real_A.to(self.device), real_B.to(self.device)
 
                     fake_A2B, _, fake_A2B_heatmap = self.genA2B(real_A)
@@ -491,16 +513,16 @@ class UGATIT(object) :
 
                     if self.mel_spectrogram:
                         if self.use_noise:
-                            A2B = torch.cat((A2B, noise.detach().cpu().squeeze()), axis=1)
-                            B2A = torch.cat((B2A, noise.detach().cpu().squeeze()), axis=1)
-                        A2B = torch.cat((A2B, real_A[0].detach().cpu().squeeze(),
-                                            fake_A2A[0].detach().cpu().squeeze(),
-                                            fake_A2B[0].detach().cpu().squeeze(),
-                                            fake_A2B2A[0].detach().cpu().squeeze()), axis=1)
-                        B2A = torch.cat((B2A, real_B[0].detach().cpu().squeeze(),
-                                            fake_B2B[0].detach().cpu().squeeze(),
-                                            fake_B2A[0].detach().cpu().squeeze(),
-                                            fake_B2A2B[0].detach().cpu().squeeze()), axis=1)
+                            A2B = torch.cat((A2B, noise.detach().cpu()), axis=2)
+                            B2A = torch.cat((B2A, noise.detach().cpu()), axis=2)
+                        A2B = torch.cat((A2B, real_A[0].detach().cpu(),
+                                            fake_A2A[0].detach().cpu(),
+                                            fake_A2B[0].detach().cpu(),
+                                            fake_A2B2A[0].detach().cpu()), axis=2)
+                        B2A = torch.cat((B2A, real_B[0].detach().cpu(),
+                                            fake_B2B[0].detach().cpu(),
+                                            fake_B2A[0].detach().cpu(),
+                                            fake_B2A2B[0].detach().cpu()), axis=2)
                     else:
                         A2B = np.concatenate((A2B, np.concatenate((RGB2BGR(tensor2numpy(denorm(real_A[0]))),
                                                             cam(tensor2numpy(fake_A2A_heatmap[0]), self.img_size),
@@ -520,16 +542,16 @@ class UGATIT(object) :
 
                 for _ in range(test_sample_num):
                     try:
-                        real_A, _ = testA_iter.next()
+                        real_A, _ = next(testA_iter)
                     except:
                         testA_iter = iter(self.testA_loader)
-                        real_A, _ = testA_iter.next()
+                        real_A, _ = next(testA_iter)
 
                     try:
-                        real_B, _ = testB_iter.next()
+                        real_B, _ = next(testB_iter)
                     except:
                         testB_iter = iter(self.testB_loader)
-                        real_B, _ = testB_iter.next()
+                        real_B, _ = next(testB_iter)
                     real_A, real_B = real_A.to(self.device), real_B.to(self.device)
 
                     fake_A2B, _, fake_A2B_heatmap = self.genA2B(real_A)
@@ -543,14 +565,14 @@ class UGATIT(object) :
 
 
                     if self.mel_spectrogram:
-                        A2B = torch.cat((A2B, real_A[0].detach().cpu().squeeze(),
-                                            fake_A2A[0].detach().cpu().squeeze(),
-                                            fake_A2B[0].detach().cpu().squeeze(),
-                                            fake_A2B2A[0].detach().cpu().squeeze()), axis=1)
-                        B2A = torch.cat((B2A, real_B[0].detach().cpu().squeeze(),
-                                            fake_B2B[0].detach().cpu().squeeze(),
-                                            fake_B2A[0].detach().cpu().squeeze(),
-                                            fake_B2A2B[0].detach().cpu().squeeze()), axis=1)
+                        A2B = torch.cat((A2B, real_A[0].detach().cpu(),
+                                            fake_A2A[0].detach().cpu(),
+                                            fake_A2B[0].detach().cpu(),
+                                            fake_A2B2A[0].detach().cpu()), axis=2)
+                        B2A = torch.cat((B2A, real_B[0].detach().cpu(),
+                                            fake_B2B[0].detach().cpu(),
+                                            fake_B2A[0].detach().cpu(),
+                                            fake_B2A2B[0].detach().cpu()), axis=2)
                         torch.save(inv_mel_transform(A2B), os.path.join(self.result_dir, self.dataset, 'img', 'A2B_%07d.mel' % step))
                         torch.save(inv_mel_transform(B2A), os.path.join(self.result_dir, self.dataset, 'img', 'B2A_%07d.mel' % step))
                     else:
@@ -613,40 +635,61 @@ class UGATIT(object) :
             return
 
         self.genA2B.eval(), self.genB2A.eval()
+        if self.mel_spectrogram:
+            real_A_out, fake_A2A_out, fake_A2B_out, fake_A2B2A_out = None, None, None, None
         for n, (real_A, _) in enumerate(self.testA_loader):
+            print('Generating A2B sample ', n)
             real_A = real_A.to(self.device)
-
             fake_A2B, _, fake_A2B_heatmap = self.genA2B(real_A)
-
             fake_A2B2A, _, fake_A2B2A_heatmap = self.genB2A(fake_A2B)
-
             fake_A2A, _, fake_A2A_heatmap = self.genB2A(real_A)
 
-            A2B = np.concatenate((RGB2BGR(tensor2numpy(denorm(real_A[0]))),
+            if self.mel_spectrogram:
+                real_A_out = crossfade(real_A_out, real_A.detach().cpu(), self.img_size - self.test_stride, interpolate=self.test_interpolate)
+                fake_A2A_out = crossfade(fake_A2A_out, fake_A2A.detach().cpu(), self.img_size - self.test_stride, interpolate=self.test_interpolate)
+                fake_A2B_out = crossfade(fake_A2B_out, fake_A2B.detach().cpu(), self.img_size - self.test_stride, interpolate=self.test_interpolate)
+                fake_A2B2A_out = crossfade(fake_A2B2A_out, fake_A2B2A.detach().cpu(), self.img_size - self.test_stride, interpolate=self.test_interpolate)
+            else:
+                A2B = np.concatenate((RGB2BGR(tensor2numpy(denorm(real_A[0]))),
                                   cam(tensor2numpy(fake_A2A_heatmap[0]), self.img_size),
                                   RGB2BGR(tensor2numpy(denorm(fake_A2A[0]))),
                                   cam(tensor2numpy(fake_A2B_heatmap[0]), self.img_size),
                                   RGB2BGR(tensor2numpy(denorm(fake_A2B[0]))),
                                   cam(tensor2numpy(fake_A2B2A_heatmap[0]), self.img_size),
                                   RGB2BGR(tensor2numpy(denorm(fake_A2B2A[0])))), 0)
+                cv2.imwrite(os.path.join(self.result_dir, self.dataset, 'test', 'A2B_%d.png' % (n + 1)), A2B * 255.0)
+        if self.mel_spectrogram:
+            torch.save(inv_mel_transform(real_A_out), os.path.join(self.result_dir, self.dataset, 'test', 'real_A_%d.mel' % n))
+            torch.save(inv_mel_transform(fake_A2A_out), os.path.join(self.result_dir, self.dataset, 'test', 'fake_A2A_%d.mel' % n))
+            torch.save(inv_mel_transform(fake_A2B_out), os.path.join(self.result_dir, self.dataset, 'test', 'fake_A2B_%d.mel' % n))
+            torch.save(inv_mel_transform(fake_A2B2A_out), os.path.join(self.result_dir, self.dataset, 'test', 'fake_A2B2A_%d.mel' % n))
 
-            cv2.imwrite(os.path.join(self.result_dir, self.dataset, 'test', 'A2B_%d.png' % (n + 1)), A2B * 255.0)
-
+        if self.mel_spectrogram:
+            real_B_out, fake_B2B_out, fake_B2A_out, fake_B2A2B_out = None, None, None, None
         for n, (real_B, _) in enumerate(self.testB_loader):
+            print('Generating B2A sample ', n)
             real_B = real_B.to(self.device)
-
             fake_B2A, _, fake_B2A_heatmap = self.genB2A(real_B)
-
             fake_B2A2B, _, fake_B2A2B_heatmap = self.genA2B(fake_B2A)
-
             fake_B2B, _, fake_B2B_heatmap = self.genA2B(real_B)
 
-            B2A = np.concatenate((RGB2BGR(tensor2numpy(denorm(real_B[0]))),
+
+            if self.mel_spectrogram:
+                real_B_out = crossfade(real_B_out, real_B.detach().cpu(), self.img_size - self.test_stride, interpolate=self.test_interpolate)
+                fake_B2B_out = crossfade(fake_B2B_out, fake_B2B.detach().cpu(), self.img_size - self.test_stride, interpolate=self.test_interpolate)
+                fake_B2A_out = crossfade(fake_B2A_out, fake_B2A.detach().cpu(), self.img_size - self.test_stride, interpolate=self.test_interpolate)
+                fake_B2A2B_out = crossfade(fake_B2A2B_out, fake_B2A2B.detach().cpu(), self.img_size - self.test_stride, interpolate=self.test_interpolate)
+            else:
+                B2A = np.concatenate((RGB2BGR(tensor2numpy(denorm(real_B[0]))),
                                   cam(tensor2numpy(fake_B2B_heatmap[0]), self.img_size),
                                   RGB2BGR(tensor2numpy(denorm(fake_B2B[0]))),
                                   cam(tensor2numpy(fake_B2A_heatmap[0]), self.img_size),
                                   RGB2BGR(tensor2numpy(denorm(fake_B2A[0]))),
                                   cam(tensor2numpy(fake_B2A2B_heatmap[0]), self.img_size),
                                   RGB2BGR(tensor2numpy(denorm(fake_B2A2B[0])))), 0)
-
-            cv2.imwrite(os.path.join(self.result_dir, self.dataset, 'test', 'B2A_%d.png' % (n + 1)), B2A * 255.0)
+                cv2.imwrite(os.path.join(self.result_dir, self.dataset, 'test', 'B2A_%d.png' % (n + 1)), B2A * 255.0)
+        if self.mel_spectrogram:
+            torch.save(inv_mel_transform(real_B_out), os.path.join(self.result_dir, self.dataset, 'test', 'real_B_%d.mel' % n))
+            torch.save(inv_mel_transform(fake_B2B_out), os.path.join(self.result_dir, self.dataset, 'test', 'fake_B2B_%d.mel' % n))
+            torch.save(inv_mel_transform(fake_B2A_out), os.path.join(self.result_dir, self.dataset, 'test', 'fake_B2A_%d.mel' % n))
+            torch.save(inv_mel_transform(fake_B2A2B_out), os.path.join(self.result_dir, self.dataset, 'test', 'fake_B2A2B_%d.mel' % n))
