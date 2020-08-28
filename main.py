@@ -1,6 +1,8 @@
-from UGATIT import UGATIT
+import torch
 import argparse
+from UGATIT import UGATIT
 from utils import *
+from mel_utils import print_and_summarize
 
 """parsing and configuration"""
 
@@ -51,12 +53,15 @@ def parse_args():
     parser.add_argument('--cycle_noise_B', type=float, default=0., help='Proportion of noise to add to cycle loss B2A2B')
     parser.add_argument('--test_stride', type=int, default=None, help='Distance to move adjacent windows when generating contiguous audio')
     parser.add_argument('--test_interpolate', type=str2bool, default=False, help='When generating continuous audio, whether to linearly interpolate between windows or trim and concatenate')
+    parser.add_argument('--deterministic', type=str2bool, default=False, help='Fix seed for random ops')
 
     parser.add_argument('--print_input', type=str2bool, default=False, help='Print stats about inputs')
     parser.add_argument('--print_wandg', type=str2bool, default=False, help='Print stats about weights and gradients')
     parser.add_argument('--print_gen_layer', type=int, default=-1, help='Print parameters at specified index for generators')
     parser.add_argument('--print_dis_layer', type=int, default=-1, help='Print parameters at specified index for discriminators')
     parser.add_argument('--save_when_interrupted', type=str2bool, default=False, help='Save model when early termination occurs')
+
+    parser.add_argument('--DEBUG_use_old', type=str2bool, default=False, help='')
 
     return check_args(parser.parse_args())
 
@@ -89,14 +94,37 @@ def main():
     print(args)
 
     # open session
+    if args.DEBUG_use_old:
+        from UGATIT_old import UGATIT as UGATIT_old
+        gan_old = UGATIT_old(args)
+        gan_old.build_model()
     gan = UGATIT(args)
 
     # build graph
     gan.build_model()
 
+    if args.deterministic:
+        torch.manual_seed(0)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
     try:  # this try/catch is for early stopping program via keyboard interrupt
         if args.phase == 'train' :
-            gan.train()
+            outputs = [x.detach().cpu() for x in gan.train()]
+            del gan
+            if args.DEBUG_use_old:
+                if args.deterministic:
+                    torch.manual_seed(0)
+                    torch.backends.cudnn.deterministic = True
+                    torch.backends.cudnn.benchmark = False
+                old_outputs = gan_old.train()
+                print(type(outputs[0]), type(old_outputs[0]))
+                for i, j in zip(outputs, old_outputs):
+                    # for (_, i), (_, j) in zip(list(a.items()), list(b.items())):
+                        print_and_summarize(i, j)
+                        print_and_summarize(i - j)
+                        print(torch.min(i - j), torch.max(i - j))
+
             print(" [*] Training finished!")
 
         if args.phase == 'test' :

@@ -126,7 +126,7 @@ class MelFolder(DatasetFolder):
 
 class SequentialMelLoader():
     def __init__(self, dataset, width, stride=None):
-        self.dataset = iter(dataset)
+        self.dataset = dataset
         self.width = width
         if stride is None:
             self.stride = self.width // 2
@@ -134,7 +134,7 @@ class SequentialMelLoader():
             self.stride = stride
 
     def generate_samples(self):
-        for mel, _ in self.dataset:
+        for mel, _ in iter(self.dataset):
             mel = mel.unsqueeze(0)
             usable_len = mel.shape[3] - self.width
             n_iters = ceil(usable_len / self.stride)
