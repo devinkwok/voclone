@@ -84,7 +84,7 @@ def wandg_stats(*modules):
 def add_noise(source, noise, noise_prop):
     with torch.no_grad():
         return mel_transform(torch.log(torch.exp(inv_mel_transform(source)) \
-                        + torch.exp(inv_mel_transform(noise))))
+                        + torch.exp(inv_mel_transform(noise)))).unsqueeze(0)
         # source_prop = 1. - noise_prop
         # out = torch.log(torch.exp(inv_mel_transform(source)) * source_prop \
         #                 + torch.exp(inv_mel_transform(noise)) * noise_prop)
@@ -271,6 +271,84 @@ class UGATIT(object) :
         self.Rho_clipper = RhoClipper(0, 1)
 
 
+    def get_samples(self, is_test=False):
+        if is_test:
+            try:
+                real_A, _ = next(self.testA_iter)
+            except:
+                self.testA_iter = iter(self.testA_loader)
+                real_A, _ = next(self.testA_iter)
+
+            try:
+                real_B, _ = next(self.testB_iter)
+            except:
+                self.testB_iter = iter(self.testB_loader)
+                real_B, _ = next(self.testB_iter)
+        else:
+            try:
+                real_A, _ = next(self.trainA_iter)
+            except:
+                self.trainA_iter = iter(self.trainA_loader)
+                real_A, _ = next(self.trainA_iter)
+
+            try:
+                real_B, _ = next(self.trainB_iter)
+            except:
+                self.trainB_iter = iter(self.trainB_loader)
+                real_B, _ = next(self.trainB_iter)
+
+        self.noise = None
+        if self.use_noise:  # add noise to data samples if required
+            try:
+                self.noise, _ = next(self.noise_iter)
+            except:
+                self.noise_iter = iter(self.noise_loader)
+                self.noise, _ = next(self.noise_iter)
+            real_A = self.noisy(real_A, self.gen_noise_A)
+            real_B = self.noisy(real_B, self.gen_noise_B)
+
+            self.noise = self.noise.to(self.device)
+        return real_A.to(self.device), real_B.to(self.device)
+
+
+    def noisy(self, mel, noise_prop):  # wrapper including printing
+        if noise_prop <= 0.:
+            return mel
+        else:
+            noisy_mel = add_noise(mel, self.noise, noise_prop)
+            return noisy_mel
+    
+
+    def get_dis(self, sample, is_A, noise_prop):
+        tensor = self.noisy(sample, noise_prop)
+        if is_A:
+            G_logit, G_cam_logit, _ = self.disGA(tensor)
+            L_logit, L_cam_logit, _ = self.disLA(tensor)
+        else:
+            G_logit, G_cam_logit, _ = self.disGB(tensor)
+            L_logit, L_cam_logit, _ = self.disLB(tensor)
+        return G_logit, G_cam_logit, L_logit, L_cam_logit
+
+
+    def get_all_gen(self, real_A, real_B):
+        fake_A2B, fake_A2B_cam_logit, fake_A2B_heatmap = self.genA2B(real_A)
+        fake_B2A, fake_B2A_cam_logit, fake_B2A_heatmap = self.genB2A(real_B)
+
+        # add background noise to cycle
+        fake_A2B2A, _, fake_A2B2A_heatmap = self.genB2A(self.noisy(fake_A2B, self.cycle_noise_A))
+        fake_B2A2B, _, fake_B2A2B_heatmap = self.genA2B(self.noisy(fake_B2A, self.cycle_noise_B))
+
+        # add background noise to identity
+        fake_A2A, fake_A2A_cam_logit, fake_A2A_heatmap = self.genB2A(self.noisy(real_A, self.identity_noise_A))
+        fake_B2B, fake_B2B_cam_logit, fake_B2B_heatmap = self.genA2B(self.noisy(real_B, self.identity_noise_A))
+
+        return fake_A2B, fake_A2B_cam_logit, fake_A2B_heatmap, \
+                fake_B2A, fake_B2A_cam_logit, fake_B2A_heatmap, \
+                fake_A2B2A, fake_A2B2A_heatmap, fake_B2A2B, fake_B2A2B_heatmap, \
+                fake_A2A, fake_A2A_cam_logit, fake_A2A_heatmap, \
+                fake_B2B, fake_B2B_cam_logit, fake_B2B_heatmap
+
+
     def train(self):
         self.genA2B.train(), self.genB2A.train(), self.disGA.train(), self.disGB.train(), self.disLA.train(), self.disLB.train()
 
@@ -283,44 +361,18 @@ class UGATIT(object) :
                 self.load(os.path.join(self.result_dir, self.dataset, 'model'), start_iter)
                 print(" [*] Load SUCCESS")
                 if self.decay_flag and start_iter > (self.iteration // 2):
-                    self.G_optim.param_groups[0]['lr'] -= (self.lr / (self.iteration // 2)) * (start_iter - self.iteration // 2)
-                    self.D_optim.param_groups[0]['lr'] -= (self.lr / (self.iteration // 2)) * (start_iter - self.iteration // 2)
+                    self.G_optim.param_groups[0]['lr'] -= (self.gen_lr / (self.iteration // 2)) * (start_iter - self.iteration // 2)
+                    self.D_optim.param_groups[0]['lr'] -= (self.dis_lr / (self.iteration // 2)) * (start_iter - self.iteration // 2)
 
         # training loop
         print('training start !')
         start_time = time.time()
         for step in range(start_iter, self.iteration + 1):
             if self.decay_flag and step > (self.iteration // 2):
-                self.G_optim.param_groups[0]['lr'] -= (self.lr / (self.iteration // 2))
-                self.D_optim.param_groups[0]['lr'] -= (self.lr / (self.iteration // 2))
+                self.G_optim.param_groups[0]['lr'] -= (self.gen_lr / (self.iteration // 2))
+                self.D_optim.param_groups[0]['lr'] -= (self.dis_lr / (self.iteration // 2))
 
-            try:
-                real_A, _ = next(trainA_iter)
-            except:
-                trainA_iter = iter(self.trainA_loader)
-                real_A, _ = next(trainA_iter)
-
-            try:
-                real_B, _ = next(trainB_iter)
-            except:
-                trainB_iter = iter(self.trainB_loader)
-                real_B, _ = next(trainB_iter)
-
-            if self.use_noise:  # add noise to data samples if required
-                try:
-                    noise, _ = next(noise_iter)
-                except:
-                    noise_iter = iter(self.noise_loader)
-                    noise, _ = next(noise_iter)
-                if self.gen_noise_A > 0.:
-                    print('gen_real_A', summarize(real_A))
-                    real_A = add_noise(real_A, noise, self.gen_noise_A)
-                if self.gen_noise_B > 0.:
-                    real_B = add_noise(real_B, noise, self.gen_noise_B)
-                    print('gen_real_B', summarize(real_B))
-                noise = noise.to(self.device)
-            real_A, real_B = real_A.to(self.device), real_B.to(self.device)
-
+            real_A, real_B = self.get_samples()
 
             # Update D
             self.D_optim.zero_grad()
@@ -333,30 +385,10 @@ class UGATIT(object) :
             # vice versa if B has no noise and A has noise
             # if both A and B have no noise, then setting both dis_noise_A and dis_noise_B > 0.
             # means compare A2B+noise with B+noise, and B2A+noise with A+noise
-            if (not self.gen_noise_A > 0.) and self.dis_noise_A > 0.:
-                real_A_for_dis = add_noise(real_A, noise, self.dis_noise_A)
-                fake_A2B_for_dis = add_noise(fake_A2B, noise, self.dis_noise_A)
-                print('dis_real_A', summarize(real_A_for_dis), 'dis_fake_A2B', summarize(fake_A2B_for_dis))
-            else:
-                real_A_for_dis = real_A
-                fake_A2B_for_dis = fake_A2B
-            if (not self.gen_noise_B > 0.) and self.dis_noise_B > 0.:
-                real_B_for_dis = add_noise(real_B, noise, self.dis_noise_B)
-                fake_B2A_for_dis = add_noise(fake_B2A, noise, self.dis_noise_A)
-                print('dis_real_B', summarize(real_B_for_dis), 'dis_fake_B2A', summarize(fake_B2A_for_dis))
-            else:
-                real_B_for_dis = real_B
-                fake_B2A_for_dis = fake_B2A
-
-            real_GA_logit, real_GA_cam_logit, _ = self.disGA(real_A_for_dis)
-            real_LA_logit, real_LA_cam_logit, _ = self.disLA(real_A_for_dis)
-            real_GB_logit, real_GB_cam_logit, _ = self.disGB(real_B_for_dis)
-            real_LB_logit, real_LB_cam_logit, _ = self.disLB(real_B_for_dis)
-
-            fake_GA_logit, fake_GA_cam_logit, _ = self.disGA(fake_B2A_for_dis)
-            fake_LA_logit, fake_LA_cam_logit, _ = self.disLA(fake_B2A_for_dis)
-            fake_GB_logit, fake_GB_cam_logit, _ = self.disGB(fake_A2B_for_dis)
-            fake_LB_logit, fake_LB_cam_logit, _ = self.disLB(fake_A2B_for_dis)
+            real_GA_logit, real_GA_cam_logit, real_LA_logit, real_LA_cam_logit = self.get_dis(real_A, True, self.dis_noise_A)
+            real_GB_logit, real_GB_cam_logit, real_LB_logit, real_LB_cam_logit = self.get_dis(real_B, False, self.dis_noise_B)
+            fake_GA_logit, fake_GA_cam_logit, fake_LA_logit, fake_LA_cam_logit = self.get_dis(fake_B2A, True, self.dis_noise_B)
+            fake_GB_logit, fake_GB_cam_logit, fake_LB_logit, fake_LB_cam_logit = self.get_dis(fake_A2B, False, self.dis_noise_A)
 
             D_ad_loss_GA = self.MSE_loss(real_GA_logit, torch.ones_like(real_GA_logit).to(self.device)) + self.MSE_loss(fake_GA_logit, torch.zeros_like(fake_GA_logit).to(self.device))
             D_ad_cam_loss_GA = self.MSE_loss(real_GA_cam_logit, torch.ones_like(real_GA_cam_logit).to(self.device)) + self.MSE_loss(fake_GA_cam_logit, torch.zeros_like(fake_GA_cam_logit).to(self.device))
@@ -382,52 +414,13 @@ class UGATIT(object) :
             # Update G
             self.G_optim.zero_grad()
 
-            fake_A2B, fake_A2B_cam_logit, _ = self.genA2B(real_A)
-            fake_B2A, fake_B2A_cam_logit, _ = self.genB2A(real_B)
-
-            # add background noise to cycle
-            if self.cycle_noise_A > 0.:
-                fake_A2B_for_cycle = add_noise(fake_A2B, noise, self.cycle_noise_A)
-                print('fake_A2B_for_cycle', summarize(fake_A2B_for_cycle))
-            else:
-                fake_A2B_for_cycle = fake_A2B
-            if self.cycle_noise_B > 0.:
-                fake_B2A_for_cycle = add_noise(fake_B2A, noise, self.cycle_noise_B)
-                print('fake_B2A_for_cycle', summarize(fake_B2A_for_cycle))
-            else:
-                fake_B2A_for_cycle = fake_B2A
-            fake_A2B2A, _, _ = self.genB2A(fake_A2B_for_cycle)
-            fake_B2A2B, _, _ = self.genA2B(fake_B2A_for_cycle)
-
-            # add background noise to identity
-            if self.identity_noise_A > 0.:
-                real_A_for_id = add_noise(real_A, noise, self.identity_noise_A)
-                print('real_A_for_id', summarize(real_A_for_id))
-            else:
-                real_A_for_id = real_A
-            if self.identity_noise_B > 0.:
-                real_B_for_id = add_noise(real_B, noise, self.identity_noise_B)
-                print('real_B_for_id', summarize(real_B_for_id))
-            else:
-                real_B_for_id = real_B
-            fake_A2A, fake_A2A_cam_logit, _ = self.genB2A(real_A_for_id)
-            fake_B2B, fake_B2B_cam_logit, _ = self.genA2B(real_B_for_id)
+            fake_A2B, fake_A2B_cam_logit, _, fake_B2A, fake_B2A_cam_logit, _, \
+                fake_A2B2A, _, fake_B2A2B, _, fake_A2A, fake_A2A_cam_logit, _, fake_B2B, fake_B2B_cam_logit, _ \
+                = self.get_all_gen(real_A, real_B)
 
             # add background noise to fake if source has none
-            if (not self.gen_noise_A > 0.) and self.dis_noise_A > 0.:
-                fake_A2B_for_dis = add_noise(fake_A2B, noise, self.dis_noise_A)
-                print('fake_A2B_for_dis', summarize(fake_A2B_for_dis))
-            else:
-                fake_A2B_for_dis = fake_A2B
-            if (not self.gen_noise_B > 0.) and self.dis_noise_B > 0.:
-                fake_B2A_for_dis = add_noise(fake_B2A, noise, self.dis_noise_A)
-                print('fake_B2A_for_dis', summarize(fake_B2A_for_dis))
-            else:
-                fake_B2A_for_dis = fake_B2A
-            fake_GA_logit, fake_GA_cam_logit, _ = self.disGA(fake_B2A_for_dis)
-            fake_LA_logit, fake_LA_cam_logit, _ = self.disLA(fake_B2A_for_dis)
-            fake_GB_logit, fake_GB_cam_logit, _ = self.disGB(fake_A2B_for_dis)
-            fake_LB_logit, fake_LB_cam_logit, _ = self.disLB(fake_A2B_for_dis)
+            fake_GA_logit, fake_GA_cam_logit, fake_LA_logit, fake_LA_cam_logit = self.get_dis(fake_B2A, True, self.dis_noise_B)
+            fake_GB_logit, fake_GB_cam_logit, fake_LB_logit, fake_LB_cam_logit = self.get_dis(fake_A2B, False, self.dis_noise_A)
 
             G_ad_loss_GA = self.MSE_loss(fake_GA_logit, torch.ones_like(fake_GA_logit).to(self.device))
             G_ad_cam_loss_GA = self.MSE_loss(fake_GA_cam_logit, torch.ones_like(fake_GA_cam_logit).to(self.device))
@@ -489,32 +482,17 @@ class UGATIT(object) :
 
                 self.genA2B.eval(), self.genB2A.eval(), self.disGA.eval(), self.disGB.eval(), self.disLA.eval(), self.disLB.eval()
                 for _ in range(train_sample_num):
-                    try:
-                        real_A, _ = next(trainA_iter)
-                    except:
-                        trainA_iter = iter(self.trainA_loader)
-                        real_A, _ = next(trainA_iter)
+                    real_A, real_B = self.get_samples()
 
-                    try:
-                        real_B, _ = next(trainB_iter)
-                    except:
-                        trainB_iter = iter(self.trainB_loader)
-                        real_B, _ = next(trainB_iter)
-                    real_A, real_B = real_A.to(self.device), real_B.to(self.device)
-
-                    fake_A2B, _, fake_A2B_heatmap = self.genA2B(real_A)
-                    fake_B2A, _, fake_B2A_heatmap = self.genB2A(real_B)
-
-                    fake_A2B2A, _, fake_A2B2A_heatmap = self.genB2A(fake_A2B)
-                    fake_B2A2B, _, fake_B2A2B_heatmap = self.genA2B(fake_B2A)
-
-                    fake_A2A, _, fake_A2A_heatmap = self.genB2A(real_A)
-                    fake_B2B, _, fake_B2B_heatmap = self.genA2B(real_B)
+                    fake_A2B, _, fake_A2B_heatmap, fake_B2A, _, fake_B2A_heatmap, \
+                        fake_A2B2A, fake_A2B2A_heatmap, fake_B2A2B, fake_B2A2B_heatmap, \
+                        fake_A2A, _, fake_A2A_heatmap, fake_B2B, _, fake_B2B_heatmap \
+                        = self.get_all_gen(real_A, real_B)
 
                     if self.mel_spectrogram:
                         if self.use_noise:
-                            A2B = torch.cat((A2B, noise.detach().cpu()), axis=2)
-                            B2A = torch.cat((B2A, noise.detach().cpu()), axis=2)
+                            A2B = torch.cat((A2B, self.noise[0].detach().cpu()), axis=2)
+                            B2A = torch.cat((B2A, self.noise[0].detach().cpu()), axis=2)
                         A2B = torch.cat((A2B, real_A[0].detach().cpu(),
                                             fake_A2A[0].detach().cpu(),
                                             fake_A2B[0].detach().cpu(),
@@ -541,28 +519,12 @@ class UGATIT(object) :
                                                             RGB2BGR(tensor2numpy(denorm(fake_B2A2B[0])))), 0)), 1)
 
                 for _ in range(test_sample_num):
-                    try:
-                        real_A, _ = next(testA_iter)
-                    except:
-                        testA_iter = iter(self.testA_loader)
-                        real_A, _ = next(testA_iter)
+                    real_A, real_B = self.get_samples(is_test=True)
 
-                    try:
-                        real_B, _ = next(testB_iter)
-                    except:
-                        testB_iter = iter(self.testB_loader)
-                        real_B, _ = next(testB_iter)
-                    real_A, real_B = real_A.to(self.device), real_B.to(self.device)
-
-                    fake_A2B, _, fake_A2B_heatmap = self.genA2B(real_A)
-                    fake_B2A, _, fake_B2A_heatmap = self.genB2A(real_B)
-
-                    fake_A2B2A, _, fake_A2B2A_heatmap = self.genB2A(fake_A2B)
-                    fake_B2A2B, _, fake_B2A2B_heatmap = self.genA2B(fake_B2A)
-
-                    fake_A2A, _, fake_A2A_heatmap = self.genB2A(real_A)
-                    fake_B2B, _, fake_B2B_heatmap = self.genA2B(real_B)
-
+                    fake_A2B, _, fake_A2B_heatmap, fake_B2A, _, fake_B2A_heatmap, \
+                        fake_A2B2A, fake_A2B2A_heatmap, fake_B2A2B, fake_B2A2B_heatmap, \
+                        fake_A2A, _, fake_A2A_heatmap, fake_B2B, _, fake_B2B_heatmap \
+                        = self.get_all_gen(real_A, real_B)
 
                     if self.mel_spectrogram:
                         A2B = torch.cat((A2B, real_A[0].detach().cpu(),
