@@ -230,9 +230,9 @@ class UGATIT(object) :
     def noisy(self, mel, noise_prop):  # wrapper including printing
         if noise_prop <= 0.:
             return mel
-        else:
-            noisy_mel = add_noise(mel, self.noise, noise_prop)
-            return noisy_mel
+        if torch.rand([1]).item() < noise_prop:
+            return add_mels(mel, self.noise)
+        return mel
     
 
     def get_dis(self, sample, is_A, noise_prop):
@@ -452,8 +452,6 @@ class UGATIT(object) :
                                             fake_B2B[0].detach().cpu(),
                                             fake_B2A[0].detach().cpu(),
                                             fake_B2A2B[0].detach().cpu()), axis=2)
-                        # return self.genA2B.state_dict(), self.genB2A.state_dict(), self.disGA.state_dict(), self.disGB.state_dict(), self.disLA.state_dict(), self.disLB.state_dict()
-                        return A2B, B2A
                         torch.save(inv_mel_transform(A2B), os.path.join(self.result_dir, self.dataset, 'img', 'A2B_%07d.mel' % step))
                         torch.save(inv_mel_transform(B2A), os.path.join(self.result_dir, self.dataset, 'img', 'B2A_%07d.mel' % step))
                     else:

@@ -61,8 +61,6 @@ def parse_args():
     parser.add_argument('--print_dis_layer', type=int, default=-1, help='Print parameters at specified index for discriminators')
     parser.add_argument('--save_when_interrupted', type=str2bool, default=False, help='Save model when early termination occurs')
 
-    parser.add_argument('--DEBUG_use_old', type=str2bool, default=False, help='')
-
     return check_args(parser.parse_args())
 
 """checking arguments"""
@@ -94,10 +92,6 @@ def main():
     print(args)
 
     # open session
-    if args.DEBUG_use_old:
-        from UGATIT_old import UGATIT as UGATIT_old
-        gan_old = UGATIT_old(args)
-        gan_old.build_model()
     gan = UGATIT(args)
 
     # build graph
@@ -110,21 +104,7 @@ def main():
 
     try:  # this try/catch is for early stopping program via keyboard interrupt
         if args.phase == 'train' :
-            outputs = [x.detach().cpu() for x in gan.train()]
-            del gan
-            if args.DEBUG_use_old:
-                if args.deterministic:
-                    torch.manual_seed(0)
-                    torch.backends.cudnn.deterministic = True
-                    torch.backends.cudnn.benchmark = False
-                old_outputs = gan_old.train()
-                print(type(outputs[0]), type(old_outputs[0]))
-                for i, j in zip(outputs, old_outputs):
-                    # for (_, i), (_, j) in zip(list(a.items()), list(b.items())):
-                        print_and_summarize(i, j)
-                        print_and_summarize(i - j)
-                        print(torch.min(i - j), torch.max(i - j))
-
+            gan.train()
             print(" [*] Training finished!")
 
         if args.phase == 'test' :
