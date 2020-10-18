@@ -38,10 +38,11 @@ def parse_args():
     parser.add_argument('--benchmark_flag', type=str2bool, default=False)
     parser.add_argument('--resume', type=str2bool, default=False)
 
-    parser.add_argument('--mel_spectrogram', type=str2bool, default=False, help='Input mel spectrograms instead of images')
     parser.add_argument('--gen_lr', type=float, required=False, help='Learning rate for generator')
     parser.add_argument('--dis_lr', type=float, required=False, help='Learning rate for discriminator')
 
+    parser.add_argument('--mel_spectrogram', type=str2bool, default=False, help='Input mel spectrograms instead of images')
+    parser.add_argument('--mel_channels', type=int, default=80, help='The (vertical) height of mel spectrogram (img_size is time/horizontal width)')
     parser.add_argument('--use_noise', type=str2bool, default=False, help='Use noise data in DATASET/noise')
     parser.add_argument('--gen_noise_A', type=float, default=0., help='Proportion of noise to add to A samples before generation')
     parser.add_argument('--gen_noise_B', type=float, default=0., help='Proportion of noise to add to B samples before generation')
@@ -60,6 +61,12 @@ def parse_args():
     parser.add_argument('--print_gen_layer', type=int, default=-1, help='Print parameters at specified index for generators')
     parser.add_argument('--print_dis_layer', type=int, default=-1, help='Print parameters at specified index for discriminators')
     parser.add_argument('--save_when_interrupted', type=str2bool, default=False, help='Save model when early termination occurs')
+    parser.add_argument('--adjust_noise_volume', type=str2bool, default=False, help='Experimental feature to make noise/source distribution more accurate')
+    parser.add_argument('--NOISE_n_samples', type=int, default=100, help='This is an experiment to check effect of noise distribution on loss, set `phase` to NOISE_test')
+    parser.add_argument('--scale_volume_A', type=float, default=0.1, help='Random augmentation of A samples by scaling volume (no noise added)')
+    parser.add_argument('--scale_volume_B', type=float, default=0.05, help='Random augmentation of B samples by scaling volume (with noise added)')
+    parser.add_argument('--scale_volume_noise', type=float, default=0.15, help='Random scaling of noise samples to avoid covering up signal (B samples)')
+    parser.add_argument('--noise_margin', type=float, default=0.03, help='Min mean diff between noise and B samples to trigger scaling')
 
     return check_args(parser.parse_args())
 
@@ -110,6 +117,11 @@ def main():
         if args.phase == 'test' :
             gan.test()
             print(" [*] Test finished!")
+
+        if args.phase == 'NOISE_test' :
+            cols = gan.noise_test(args.NOISE_n_samples)
+            print(cols)
+            print(" [*] NOISE_test finished!")
 
     except (KeyboardInterrupt, SystemExit):
         print('Interrupted')

@@ -143,7 +143,7 @@ class SequentialMelLoader():
             mel = F.pad(mel, pad=(0, target_len - usable_len), mode='constant', value=0)
             # need to add 1 to self.width to include the last iteration
             for i in range(0, mel.shape[3] - self.width + 1, self.stride):
-                yield mel[:,:,:, i:i + self.width], None
+                yield mel[:,:,:, i:i + self.width], (i, i)
 
     def __iter__(self):
         return self.generate_samples()

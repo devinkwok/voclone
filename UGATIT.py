@@ -5,8 +5,10 @@ from torch.utils.data import DataLoader
 from networks import *
 from utils import *
 from glob import glob
+import torch.nn.functional as F
 
 from mel_utils import *
+from iterseq import *
 
 
 class UGATIT(object) :
@@ -56,6 +58,8 @@ class UGATIT(object) :
 
         # new params
         self.mel_spectrogram = args.mel_spectrogram
+        self.mel_channels = args.mel_channels
+        assert self.mel_channels <= self.img_size  # can't have more channels than the image input size
         self.print_input = args.print_input
         self.print_wandg = args.print_wandg
         if args.gen_lr is None:
@@ -83,28 +87,26 @@ class UGATIT(object) :
 
         self.print_gen_layer = args.print_gen_layer
         self.print_dis_layer = args.print_dis_layer
+        self.adjust_noise_volume = args.adjust_noise_volume
+        self.scale_volume_A = args.scale_volume_A
+        self.scale_volume_B = args.scale_volume_B
+        self.scale_volume_noise = args.scale_volume_noise
+        self.noise_margin = args.noise_margin
 
         print()
-
         print("##### Information #####")
         print("# mel_spectrogram : ", self.mel_spectrogram)
         print("# light : ", self.light)
         print("# dataset : ", self.dataset)
         print("# batch_size : ", self.batch_size)
         print("# iteration per epoch : ", self.iteration)
-
-        print("NEW!!!!!!")
-
+        print()
         print("##### Generator #####")
         print("# residual blocks : ", self.n_res)
-
         print()
-
         print("##### Discriminator #####")
         print("# discriminator layer : ", self.n_dis)
-
         print()
-
         print("##### Weight #####")
         print("# adv_weight : ", self.adv_weight)
         print("# cycle_weight : ", self.cycle_weight)
@@ -119,26 +121,27 @@ class UGATIT(object) :
     def build_model(self):
         """ DataLoader """
         if self.mel_spectrogram:
-            train_transform = transforms.Compose([
-                transforms.Lambda(lambda x: print_and_summarize(x, prefix='before', do_print=self.print_input)),
-                transforms.Lambda(mel_transform),
-                transforms.Lambda(lambda x: random_crop(x, self.img_size)),
-                transforms.Lambda(lambda x: print_and_summarize(x, prefix='    after', do_print=self.print_input)),
+            transform = transforms.Compose([
+                transforms.Lambda(lambda x: mel_transform(x).unsqueeze(0)),
+                transforms.Lambda(lambda x: pad_mel_channels(x, self.img_size)),
+                # transforms.Lambda(lambda x: print_and_summarize(x, prefix='    after', do_print=self.print_input)),
             ])
-            test_transform = transforms.Compose([
-                transforms.Lambda(lambda x: print_and_summarize(x, prefix='before', do_print=self.print_input)),
-                transforms.Lambda(mel_transform),
-                transforms.Lambda(lambda x: print_and_summarize(x, prefix='    after', do_print=self.print_input)),
-            ])
-            self.trainA = MelFolder(os.path.join('dataset', self.dataset, 'trainA'), train_transform)
-            self.trainB = MelFolder(os.path.join('dataset', self.dataset, 'trainB'), train_transform)
-            self.testA = MelFolder(os.path.join('dataset', self.dataset, 'testA'), test_transform)
-            self.testB = MelFolder(os.path.join('dataset', self.dataset, 'testB'), test_transform)
+            transform_A = transform
+            if self.scale_volume_A > 0.:
+                transform_A = transforms.Compose([transform,
+                    transforms.Lambda(lambda x: scale_volume(x,  1. - self.scale_volume_A, 1. + self.scale_volume_A)),
+                    ])
+            self.trainA = MelDir(os.path.join('dataset', self.dataset, 'trainA'))
+            self.trainB = MelDir(os.path.join('dataset', self.dataset, 'trainB'))
+            self.testA = MelFolder(os.path.join('dataset', self.dataset, 'testA'), transform)
+            self.testB = MelFolder(os.path.join('dataset', self.dataset, 'testB'), transform)
+            self.trainA_loader = StridedSequence(self.trainA, self.img_size, transforms=transform_A).get_data_loader(self.batch_size, 1)
+            self.trainB_loader = StridedSequence(self.trainB, self.img_size, transforms=transform).get_data_loader(self.batch_size, 1)
             self.testA_loader = SequentialMelLoader(self.testA, self.img_size, stride=self.test_stride)
             self.testB_loader = SequentialMelLoader(self.testB, self.img_size, stride=self.test_stride)
             if self.use_noise:
-                self.noise_data = MelFolder(os.path.join('dataset', self.dataset, 'noise'), train_transform)
-                self.noise_loader = DataLoader(self.noise_data, batch_size=self.batch_size, shuffle=True)
+                self.noise_data = MelDir(os.path.join('dataset', self.dataset, 'noise'))
+                self.noise_loader = StridedSequence(self.noise_data, self.img_size, transforms=transform).get_data_loader(self.batch_size, 1)
         else:
             train_transform = transforms.Compose([
                 transforms.RandomHorizontalFlip(),
@@ -160,11 +163,10 @@ class UGATIT(object) :
             self.trainB = ImageFolder(os.path.join('dataset', self.dataset, 'trainB'), train_transform)
             self.testA = ImageFolder(os.path.join('dataset', self.dataset, 'testA'), test_transform)
             self.testB = ImageFolder(os.path.join('dataset', self.dataset, 'testB'), test_transform)
+            self.trainA_loader = DataLoader(self.trainA, batch_size=self.batch_size, shuffle=True)
+            self.trainB_loader = DataLoader(self.trainB, batch_size=self.batch_size, shuffle=True)
             self.testA_loader = DataLoader(self.testA, batch_size=1, shuffle=False)
             self.testB_loader = DataLoader(self.testB, batch_size=1, shuffle=False)
-
-        self.trainA_loader = DataLoader(self.trainA, batch_size=self.batch_size, shuffle=True)
-        self.trainB_loader = DataLoader(self.trainB, batch_size=self.batch_size, shuffle=True)
 
         """ Define Generator, Discriminator """
         self.genA2B = ResnetGenerator(input_nc=self.img_ch, output_nc=self.img_ch, ngf=self.ch, n_blocks=self.n_res, img_size=self.img_size, light=self.light).to(self.device)
@@ -185,52 +187,63 @@ class UGATIT(object) :
 
         """ Define Rho clipper to constraint the value of rho in AdaILN and ILN"""
         self.Rho_clipper = RhoClipper(0, 1)
+        self.start_iter = 1
+
+        if self.resume:
+            self.load_latest_checkpoint()
 
 
     def get_samples(self, is_test=False):
         if is_test:
             try:
-                real_A, _ = next(self.testA_iter)
+                real_A, (key_A, coord_A) = next(self.testA_iter)
             except:
                 self.testA_iter = iter(self.testA_loader)
-                real_A, _ = next(self.testA_iter)
+                real_A, (key_A, coord_A) = next(self.testA_iter)
 
             try:
-                real_B, _ = next(self.testB_iter)
+                real_B, (key_B, coord_B) = next(self.testB_iter)
             except:
                 self.testB_iter = iter(self.testB_loader)
-                real_B, _ = next(self.testB_iter)
+                real_B, (key_B, coord_B) = next(self.testB_iter)
         else:
             try:
-                real_A, _ = next(self.trainA_iter)
+                real_A, (key_A, coord_A) = next(self.trainA_iter)
             except:
                 self.trainA_iter = iter(self.trainA_loader)
-                real_A, _ = next(self.trainA_iter)
+                real_A, (key_A, coord_A) = next(self.trainA_iter)
 
             try:
-                real_B, _ = next(self.trainB_iter)
+                real_B, (key_B, coord_B) = next(self.trainB_iter)
             except:
                 self.trainB_iter = iter(self.trainB_loader)
-                real_B, _ = next(self.trainB_iter)
+                real_B, (key_B, coord_B) = next(self.trainB_iter)
 
         self.noise_A, self.noise_B = None, None
         if self.use_noise:  # add noise to data samples if required
             try:
-                self.noise_A, _ = next(self.noise_iter)
+                self.noise_A, (key_NA, coord_NA) = next(self.noise_iter)
             except:
                 self.noise_iter = iter(self.noise_loader)
-                self.noise_A, _ = next(self.noise_iter)
+                self.noise_A, (key_NA, coord_NA) = next(self.noise_iter)
             try:
-                self.noise_B, _ = next(self.noise_iter)
+                self.noise_B, (key_NB, coord_NB) = next(self.noise_iter)
             except:
                 self.noise_iter = iter(self.noise_loader)
-                self.noise_B, _ = next(self.noise_iter)
+                self.noise_B, (key_NB, coord_NB) = next(self.noise_iter)
             if not is_test:
                 real_A = self.noisy(real_A, self.gen_noise_A, True)
                 real_B = self.noisy(real_B, self.gen_noise_B, False)
 
             self.noise_A = self.noise_A.to(self.device)
             self.noise_B = self.noise_B.to(self.device)
+
+        # static_A = detect_static(unpad_mel_channels(inv_mel_transform(real_A), self.mel_channels))
+        # static_B = detect_static(unpad_mel_channels(inv_mel_transform(real_B), self.mel_channels))
+        # if static_A is not None:
+        #     print("                      !!!!", key_A, coord_A, static_A)
+        # if static_B is not None:
+        #     print("                      !!!!", key_B, coord_B, key_NB, coord_NB, static_B)
         return real_A.to(self.device), real_B.to(self.device)
 
 
@@ -238,10 +251,17 @@ class UGATIT(object) :
         if noise_prop <= 0.:
             return mel
         if torch.rand([1]).item() < noise_prop:
-            if is_A:
-                return add_mels(mel, self.noise_A)
+            if self.adjust_noise_volume:
+                mel, noise = noise_normalizer(mel, self.noise_A, self.noise_B, self.noise_margin, self.scale_volume_noise)
             else:
-                return add_mels(mel, self.noise_B)
+                if is_A:
+                    noise = self.noise_A
+                else:
+                    noise = self.noise_B
+            combined = add_mels(mel, noise)
+            if self.scale_volume_B > 0.:
+                combined = scale_volume(combined, 1. - self.scale_volume_B, 1. + self.scale_volume_B)
+            return combined
         return mel
     
 
@@ -272,6 +292,8 @@ class UGATIT(object) :
         fake_X2Y2X, _, fake_X2Y2X_heatmap = genY2X(self.noisy(fake_X2Y, cycle_noise, is_A))
         # add background noise to identity
         fake_X2X, fake_X2X_cam_logit, fake_X2X_heatmap = genY2X(self.noisy(real_X, id_noise, is_A))
+
+        fake_X2Y = strip_padded(fake_X2Y, self.mel_channels)
 
         return fake_X2Y, fake_X2Y_cam_logit, fake_X2Y_heatmap, \
                 fake_X2Y2X, fake_X2Y2X_heatmap, \
@@ -328,22 +350,10 @@ class UGATIT(object) :
     def train(self):
         self.genA2B.train(), self.genB2A.train(), self.disGA.train(), self.disGB.train(), self.disLA.train(), self.disLB.train()
 
-        start_iter = 1
-        if self.resume:
-            model_list = glob(os.path.join(self.result_dir, self.dataset, 'model', '*.pt'))
-            if not len(model_list) == 0:
-                model_list.sort()
-                start_iter = int(model_list[-1].split('_')[-1].split('.')[0])
-                self.load(os.path.join(self.result_dir, self.dataset, 'model'), start_iter)
-                print(" [*] Load SUCCESS")
-                if self.decay_flag and start_iter > (self.iteration // 2):
-                    self.G_optim.param_groups[0]['lr'] -= (self.gen_lr / (self.iteration // 2)) * (start_iter - self.iteration // 2)
-                    self.D_optim.param_groups[0]['lr'] -= (self.dis_lr / (self.iteration // 2)) * (start_iter - self.iteration // 2)
-
         # training loop
         print('training start !')
         start_time = time.time()
-        for step in range(start_iter, self.iteration + 1):
+        for step in range(self.start_iter, self.iteration + 1):
             if self.decay_flag and step > (self.iteration // 2):
                 self.G_optim.param_groups[0]['lr'] -= (self.gen_lr / (self.iteration // 2))
                 self.D_optim.param_groups[0]['lr'] -= (self.dis_lr / (self.iteration // 2))
@@ -355,6 +365,8 @@ class UGATIT(object) :
 
             fake_A2B, _, _ = self.genA2B(real_A)
             fake_B2A, _, _ = self.genB2A(real_B)
+            fake_A2B = strip_padded(fake_A2B, self.mel_channels)
+            fake_B2A = strip_padded(fake_B2A, self.mel_channels)
 
             # if dis_noise_A > 0., this means add noise to A, or that A has no noise and B has noise
             # then A2B will have no noise while B2A will have noise, so compare A2B+noise with B, and B2A with A+noise
@@ -366,6 +378,11 @@ class UGATIT(object) :
             fake_GA_logit, fake_GA_cam_logit, fake_LA_logit, fake_LA_cam_logit = self.get_dis(fake_B2A, self.dis_noise_B, is_A=True)
             fake_GB_logit, fake_GB_cam_logit, fake_LB_logit, fake_LB_cam_logit = self.get_dis(fake_A2B, self.dis_noise_A, is_A=False)
 
+            # print('logits')
+            # print(torch.std_mean(real_GA_logit), torch.std_mean(real_GA_cam_logit), torch.std_mean(real_LA_logit), torch.std_mean(real_LA_cam_logit))
+            # print(torch.std_mean(real_GB_logit), torch.std_mean(real_GB_cam_logit), torch.std_mean(real_LB_logit), torch.std_mean(real_LB_cam_logit))
+            # print(torch.std_mean(fake_GA_logit), torch.std_mean(fake_GA_cam_logit), torch.std_mean(fake_LA_logit), torch.std_mean(fake_LA_cam_logit))
+            # print(torch.std_mean(fake_GB_logit), torch.std_mean(fake_GB_cam_logit), torch.std_mean(fake_LB_logit), torch.std_mean(fake_LB_cam_logit))
             D_ad_loss_GA = self.MSE_loss(real_GA_logit, torch.ones_like(real_GA_logit).to(self.device)) + self.MSE_loss(fake_GA_logit, torch.zeros_like(fake_GA_logit).to(self.device))
             D_ad_cam_loss_GA = self.MSE_loss(real_GA_cam_logit, torch.ones_like(real_GA_cam_logit).to(self.device)) + self.MSE_loss(fake_GA_cam_logit, torch.zeros_like(fake_GA_cam_logit).to(self.device))
             D_ad_loss_LA = self.MSE_loss(real_LA_logit, torch.ones_like(real_LA_logit).to(self.device)) + self.MSE_loss(fake_LA_logit, torch.zeros_like(fake_LA_logit).to(self.device))
@@ -459,8 +476,8 @@ class UGATIT(object) :
                 if self.mel_spectrogram:
                     A2B = A2B.transpose(2, 1, 0, 3).reshape(self.img_size, -1)
                     B2A = B2A.transpose(2, 1, 0, 3).reshape(self.img_size, -1)
-                    torch.save(inv_mel_transform(A2B), os.path.join(self.result_dir, self.dataset, 'img', 'A2B_%07d.mel' % step))
-                    torch.save(inv_mel_transform(B2A), os.path.join(self.result_dir, self.dataset, 'img', 'B2A_%07d.mel' % step))
+                    self.save_mel(A2B, 'img', 'A2B_%07d.mel' % step)
+                    self.save_mel(B2A, 'img', 'B2A_%07d.mel' % step)
                 else:
                     cv2.imwrite(os.path.join(self.result_dir, self.dataset, 'img', 'A2B_%07d.png' % step), A2B * 255.0)
                     cv2.imwrite(os.path.join(self.result_dir, self.dataset, 'img', 'B2A_%07d.png' % step), B2A * 255.0)
@@ -471,6 +488,11 @@ class UGATIT(object) :
                 self.save(os.path.join(self.result_dir, self.dataset, 'model'), step)
             if step % 1000 == 0:
                 self.save(self.result_dir, 'latest')
+
+    def save_mel(self, mel, subdir, name):
+        torch.save(
+            unpad_mel_channels(torch.tensor(inv_mel_transform(mel)), self.mel_channels).numpy().squeeze(),
+            os.path.join(self.result_dir, self.dataset, subdir, name))
 
     def save(self, dir, step):
         params = {}
@@ -485,6 +507,17 @@ class UGATIT(object) :
         else:
             torch.save(params, os.path.join(dir, self.dataset + '_params_%s.pt' % step))
 
+    def load_latest_checkpoint(self):
+        model_list = glob(os.path.join(self.result_dir, self.dataset, 'model', '*.pt'))
+        if not len(model_list) == 0:
+            model_list.sort()
+            self.start_iter = int(model_list[-1].split('_')[-1].split('.')[0])
+            self.load(os.path.join(self.result_dir, self.dataset, 'model'), self.start_iter)
+            print(" [*] Load SUCCESS")
+            if self.decay_flag and self.start_iter > (self.iteration // 2):
+                self.G_optim.param_groups[0]['lr'] -= (self.gen_lr / (self.iteration // 2)) * (self.start_iter - self.iteration // 2)
+                self.D_optim.param_groups[0]['lr'] -= (self.dis_lr / (self.iteration // 2)) * (self.start_iter - self.iteration // 2)
+
     def load(self, dir, step):
         params = torch.load(os.path.join(dir, self.dataset + '_params_%07d.pt' % step))
         self.genA2B.load_state_dict(params['genA2B'])
@@ -495,15 +528,6 @@ class UGATIT(object) :
         self.disLB.load_state_dict(params['disLB'])
 
     def test(self):
-        model_list = glob(os.path.join(self.result_dir, self.dataset, 'model', '*.pt'))
-        if not len(model_list) == 0:
-            model_list.sort()
-            iter = int(model_list[-1].split('_')[-1].split('.')[0])
-            self.load(os.path.join(self.result_dir, self.dataset, 'model'), iter)
-            print(" [*] Load SUCCESS")
-        else:
-            print(" [*] Load FAILURE")
-            return
 
         self.genA2B.eval(), self.genB2A.eval()
         if self.mel_spectrogram:
@@ -530,10 +554,10 @@ class UGATIT(object) :
                                   RGB2BGR(tensor2numpy(denorm(fake_A2B2A[0])))), 0)
                 cv2.imwrite(os.path.join(self.result_dir, self.dataset, 'test', 'A2B_%d.png' % (n + 1)), A2B * 255.0)
         if self.mel_spectrogram:
-            torch.save(inv_mel_transform(real_A_out), os.path.join(self.result_dir, self.dataset, 'test', 'real_A_%d.mel' % n))
-            torch.save(inv_mel_transform(fake_A2A_out), os.path.join(self.result_dir, self.dataset, 'test', 'fake_A2A_%d.mel' % n))
-            torch.save(inv_mel_transform(fake_A2B_out), os.path.join(self.result_dir, self.dataset, 'test', 'fake_A2B_%d.mel' % n))
-            torch.save(inv_mel_transform(fake_A2B2A_out), os.path.join(self.result_dir, self.dataset, 'test', 'fake_A2B2A_%d.mel' % n))
+            self.save_mel(real_A_out, 'test', 'real_A_%d.mel' % n)
+            self.save_mel(fake_A2A_out, 'test', 'fake_A2A_%d.mel' % n)
+            self.save_mel(fake_A2B_out, 'test', 'fake_A2B_%d.mel' % n)
+            self.save_mel(fake_A2B2A_out, 'test', 'fake_A2B2A_%d.mel' % n)
 
         if self.mel_spectrogram:
             real_B_out, fake_B2B_out, fake_B2A_out, fake_B2A2B_out = None, None, None, None
@@ -560,7 +584,64 @@ class UGATIT(object) :
                                   RGB2BGR(tensor2numpy(denorm(fake_B2A2B[0])))), 0)
                 cv2.imwrite(os.path.join(self.result_dir, self.dataset, 'test', 'B2A_%d.png' % (n + 1)), B2A * 255.0)
         if self.mel_spectrogram:
-            torch.save(inv_mel_transform(real_B_out), os.path.join(self.result_dir, self.dataset, 'test', 'real_B_%d.mel' % n))
-            torch.save(inv_mel_transform(fake_B2B_out), os.path.join(self.result_dir, self.dataset, 'test', 'fake_B2B_%d.mel' % n))
-            torch.save(inv_mel_transform(fake_B2A_out), os.path.join(self.result_dir, self.dataset, 'test', 'fake_B2A_%d.mel' % n))
-            torch.save(inv_mel_transform(fake_B2A2B_out), os.path.join(self.result_dir, self.dataset, 'test', 'fake_B2A2B_%d.mel' % n))
+            self.save_mel(real_B_out, 'test', 'real_B_%d.mel' % n)
+            self.save_mel(fake_B2B_out, 'test', 'fake_B2B_%d.mel' % n)
+            self.save_mel(fake_B2A_out, 'test', 'fake_B2A_%d.mel' % n)
+            self.save_mel(fake_B2A2B_out, 'test', 'fake_B2A2B_%d.mel' % n)
+
+    def noise_test(self, n_samples):
+
+        def stats(mel):
+            std, mean = torch.std_mean(mel)
+            logits = self.get_dis(mel, self.dis_noise_B, is_A=True)
+            prob = 0.
+            for logit in logits:
+                prob += torch.mean(logit).item()
+            prob = prob / 4.
+            return prob, mean.item(), std.item()
+
+        with torch.no_grad():
+            cols = []
+            self.use_noise = False
+            for _ in range(n_samples):
+                try:
+                    real_B, (key_B, coord_B) = next(self.trainB_iter)
+                except:
+                    self.trainB_iter = iter(self.trainB_loader)
+                    real_B, (key_B, coord_B) = next(self.trainB_iter)
+
+                real_B = real_B.to(self.device)
+                fake_B2A, _, _ = self.genB2A(real_B)
+
+                rows = []
+                for _ in range(n_samples):
+                    try:
+                        self.noise_B, (key_NB, coord_NB) = next(self.noise_iter)
+                    except:
+                        self.noise_iter = iter(self.noise_loader)
+                        self.noise_B, (key_NB, coord_NB) = next(self.noise_iter)
+                    self.noise_B = self.noise_B.to(self.device)
+                    real_B_noisy = self.noisy(real_B, self.gen_noise_B, False)
+
+                    noisy_fake_B2A = self.noisy(fake_B2A, self.gen_noise_B, False)
+                    fake_B2A_noisy, _, _ = self.genB2A(real_B_noisy)
+                    # mels = np.concatenate((real_B.detach().cpu(),
+                    #                     fake_B2A.detach().cpu(),
+                    #                     noisy_fake_B2A.detach().cpu(),
+                    #                     fake_B2A_noisy.detach().cpu()), 3)
+                    # self.save_mel(mels, '', 'mel_{}_{}_{}_{}'.format(key_B[0], coord_B.item(), key_NB[0], coord_NB.item()))
+
+                    rows.append([
+                        key_NB[0], coord_NB.item(),
+                        *torch.std_mean(self.noise_B),
+                        *stats(real_B),
+                        *stats(fake_B2A),
+                        *stats(noisy_fake_B2A),
+                        *stats(fake_B2A_noisy),
+                        ])
+                cols.append([
+                    key_B[0], coord_B.item(),
+                    rows,
+                    ])
+            torch.save(cols, os.path.join(self.result_dir, self.dataset, 'NOISE_test_result_table.pickle'))
+            return cols
