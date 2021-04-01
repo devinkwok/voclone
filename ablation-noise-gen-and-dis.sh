@@ -1,6 +1,4 @@
 #!/bin/bash
-
-# ## this is the big final model
 python main.py \
     --mel_spectrogram=True \
     --num_workers=1 \

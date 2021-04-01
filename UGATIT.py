@@ -7,11 +7,14 @@ from utils import *
 from glob import glob
 import torch.nn.functional as F
 
+import pandas as pd
 from mel_utils import *
 from iterseq import *
 
 
 class UGATIT(object) :
+    """Defines model training.
+    """
     def __init__(self, args):
         self.light = args.light
 
@@ -57,6 +60,7 @@ class UGATIT(object) :
             torch.backends.cudnn.benchmark = True
 
         # new params
+        self.num_workers = args.num_workers
         self.mel_spectrogram = args.mel_spectrogram
         self.mel_channels = args.mel_channels
         assert self.mel_channels <= self.img_size  # can't have more channels than the image input size
@@ -76,6 +80,15 @@ class UGATIT(object) :
         self.gen_noise_B = args.gen_noise_B
         self.dis_noise_A = args.dis_noise_A
         self.dis_noise_B = args.dis_noise_B
+        if args.dis_noise_A2B is None:
+            self.dis_noise_A2B = self.dis_noise_A
+        else:
+            self.dis_noise_A2B = args.dis_noise_A2B
+        if args.dis_noise_B2A is None:
+            self.dis_noise_B2A = self.dis_noise_B
+        else:
+            self.dis_noise_B2A = args.dis_noise_B2A
+
         self.identity_noise_A = args.identity_noise_A
         self.identity_noise_B = args.identity_noise_B
         self.cycle_noise_A = args.cycle_noise_A
@@ -88,10 +101,40 @@ class UGATIT(object) :
         self.print_gen_layer = args.print_gen_layer
         self.print_dis_layer = args.print_dis_layer
         self.adjust_noise_volume = args.adjust_noise_volume
-        self.scale_volume_A = args.scale_volume_A
-        self.scale_volume_B = args.scale_volume_B
-        self.scale_volume_noise = args.scale_volume_noise
+        self.scale_target_volume_A = args.scale_target_volume_A
+        self.scale_target_volume_B = args.scale_target_volume_B
+        self.scale_source_volume_A = args.scale_source_volume_A
+        self.scale_source_volume_B = args.scale_source_volume_B
+        self.scale_target_volume_noise = args.scale_target_volume_noise
+        self.scale_source_volume_noise = args.scale_source_volume_noise
         self.noise_margin = args.noise_margin
+        self.noise_weight_A = args.noise_weight_A
+        self.noise_weight_B = args.noise_weight_B
+
+        self.augment_volume = args.augment_volume
+        self.w_sin_freq_A = args.w_sin_freq_A
+        self.h_sin_freq_A = args.h_sin_freq_A
+        self.w_sin_amp_A = args.w_sin_amp_A
+        self.h_sin_amp_A = args.h_sin_amp_A
+        self.sp_amp_A = args.sp_amp_A
+        self.w_stretch_max_A = args.w_stretch_max_A
+        self.h_translate_max_A = args.h_translate_max_A
+
+        self.w_sin_freq_B = args.w_sin_freq_B
+        self.h_sin_freq_B = args.h_sin_freq_B
+        self.w_sin_amp_B = args.w_sin_amp_B
+        self.h_sin_amp_B = args.h_sin_amp_B
+        self.sp_amp_B = args.sp_amp_B
+        self.w_stretch_max_B = args.w_stretch_max_B
+        self.h_translate_max_B = args.h_translate_max_B
+
+        self.w_sin_freq_noise = args.w_sin_freq_noise
+        self.h_sin_freq_noise = args.h_sin_freq_noise
+        self.w_sin_amp_noise = args.w_sin_amp_noise
+        self.h_sin_amp_noise = args.h_sin_amp_noise
+        self.sp_amp_noise = args.sp_amp_noise
+        self.w_stretch_max_noise = args.w_stretch_max_noise
+        self.h_translate_max_noise = args.h_translate_max_noise
 
         print()
         print("##### Information #####")
@@ -117,31 +160,86 @@ class UGATIT(object) :
     # Model
     ##################################################################################
 
+    @property
+    def base_transform(self):
+        """Default transformation to apply to all mel spectrograms in order
+        to make them image-like. Applies value normalization and padding.
+
+        Returns:
+            torchvision.transforms.Compose: Object containing transforms
+        """
+        return transforms.Compose([
+            transforms.Lambda(lambda x: mel_transform(x).unsqueeze(0)),
+            transforms.Lambda(lambda x: pad_mel_channels(x, self.img_size)),
+            # transforms.Lambda(lambda x: print_and_summarize(x, prefix='    in dist', do_print=self.print_input)),
+        ])
 
     def build_model(self):
-        """ DataLoader """
+        """Initialize data loaders, data transforms, generators, discriminators,
+        loss functions, and optimizers.
+        """
         if self.mel_spectrogram:
-            transform = transforms.Compose([
+            self.gen_transform_A = nn.Identity()
+            if self.scale_source_volume_A > 0.:
+                self.gen_transform_A = transforms.Compose([
+                        transforms.Lambda(lambda x: scale_volume(x,  1. - self.scale_source_volume_A, 1. + self.scale_source_volume_A)),
+                        ])
+            self.gen_transform_B = nn.Identity()
+            if self.scale_source_volume_B > 0.:
+                self.gen_transform_A = transforms.Compose([
+                        transforms.Lambda(lambda x: scale_volume(x,  1. - self.scale_source_volume_B, 1. + self.scale_source_volume_B)),
+                        ])
+            transform_A = transforms.Compose([
                 transforms.Lambda(lambda x: mel_transform(x).unsqueeze(0)),
+                transforms.Lambda(lambda x: augment_volume(x, self.w_sin_freq_A, self.h_sin_freq_A, self.w_sin_amp_A, self.h_sin_amp_A, self.sp_amp_A)),
+                transforms.Lambda(lambda x: stretch_time_and_translate_ch(x, self.img_size, self.mel_channels, self.w_stretch_max_A, self.h_translate_max_A, pad_val=-1)),
                 transforms.Lambda(lambda x: pad_mel_channels(x, self.img_size)),
-                # transforms.Lambda(lambda x: print_and_summarize(x, prefix='    after', do_print=self.print_input)),
+                # transforms.Lambda(lambda x: print_and_summarize(x, prefix='    in dist', do_print=self.print_input)),
             ])
-            transform_A = transform
-            if self.scale_volume_A > 0.:
-                transform_A = transforms.Compose([transform,
-                    transforms.Lambda(lambda x: scale_volume(x,  1. - self.scale_volume_A, 1. + self.scale_volume_A)),
+            transform_B = transforms.Compose([
+                transforms.Lambda(lambda x: mel_transform(x).unsqueeze(0)),
+                transforms.Lambda(lambda x: augment_volume(x, self.w_sin_freq_B, self.h_sin_freq_B, self.w_sin_amp_B, self.h_sin_amp_B, self.sp_amp_B)),
+                transforms.Lambda(lambda x: stretch_time_and_translate_ch(x, self.img_size, self.mel_channels, self.w_stretch_max_B, self.h_translate_max_B, pad_val=-1)),
+                transforms.Lambda(lambda x: pad_mel_channels(x, self.img_size)),
+                # transforms.Lambda(lambda x: print_and_summarize(x, prefix='    in dist', do_print=self.print_input)),
+            ])
+            transform_noise = transforms.Compose([
+                transforms.Lambda(lambda x: mel_transform(x).unsqueeze(0)),
+                transforms.Lambda(lambda x: augment_volume(x, self.w_sin_freq_noise, self.h_sin_freq_noise, self.w_sin_amp_noise, self.h_sin_amp_noise, self.sp_amp_noise)),
+                transforms.Lambda(lambda x: stretch_time_and_translate_ch(x, self.img_size, self.mel_channels, self.w_stretch_max_noise, self.h_translate_max_noise, pad_val=-1)),
+                transforms.Lambda(lambda x: pad_mel_channels(x, self.img_size)),
+                # transforms.Lambda(lambda x: print_and_summarize(x, prefix='    in dist', do_print=self.print_input)),
+            ])
+            if self.scale_target_volume_A > 0.:
+                transform_A = transforms.Compose([transform_A,
+                    transforms.Lambda(lambda x: scale_volume(x,  1. - self.scale_target_volume_A, 1. + self.scale_target_volume_A)),
+                    ])
+            if self.scale_target_volume_B > 0.:
+                transform_B = transforms.Compose([transform_B,
+                    transforms.Lambda(lambda x: scale_volume(x,  1. - self.scale_target_volume_B, 1. + self.scale_target_volume_B)),
+                    ])
+            if self.scale_target_volume_noise > 0.:
+                transform_noise = transforms.Compose([transform_noise,
+                    transforms.Lambda(lambda x: scale_volume(x,  1. - self.scale_target_volume_noise, 1. + self.scale_target_volume_noise)),
                     ])
             self.trainA = MelDir(os.path.join('dataset', self.dataset, 'trainA'))
             self.trainB = MelDir(os.path.join('dataset', self.dataset, 'trainB'))
-            self.testA = MelFolder(os.path.join('dataset', self.dataset, 'testA'), transform)
-            self.testB = MelFolder(os.path.join('dataset', self.dataset, 'testB'), transform)
-            self.trainA_loader = StridedSequence(self.trainA, self.img_size, transforms=transform_A).get_data_loader(self.batch_size, 1)
-            self.trainB_loader = StridedSequence(self.trainB, self.img_size, transforms=transform).get_data_loader(self.batch_size, 1)
+            self.testA = MelFolder(os.path.join('dataset', self.dataset, 'testA'), self.base_transform)
+            self.testB = MelFolder(os.path.join('dataset', self.dataset, 'testB'), self.base_transform)
+            self.trainA_loader = StridedSequence(self.trainA, self.img_size + self.w_stretch_max_A, transforms=transform_A).get_data_loader(self.batch_size, self.num_workers)
+            self.trainB_loader = StridedSequence(self.trainB, self.img_size + self.w_stretch_max_B, transforms=transform_B).get_data_loader(self.batch_size, self.num_workers)
             self.testA_loader = SequentialMelLoader(self.testA, self.img_size, stride=self.test_stride)
             self.testB_loader = SequentialMelLoader(self.testB, self.img_size, stride=self.test_stride)
+            self.trainA_visits = {}
+            self.trainB_visits = {}
             if self.use_noise:
                 self.noise_data = MelDir(os.path.join('dataset', self.dataset, 'noise'))
-                self.noise_loader = StridedSequence(self.noise_data, self.img_size, transforms=transform).get_data_loader(self.batch_size, 1)
+                self.noise_loader = StridedSequence(self.noise_data, self.img_size + self.w_stretch_max_noise, transforms=transform_noise).get_data_loader(self.batch_size, self.num_workers)
+                self.noise_visits = {}
+            print('Datasets: A {} ({}), B {} ({}), noise {} ({})'.format(
+                                self.trainA_loader.dataset.n_seq, self.trainA_loader.dataset.stride,
+                                self.trainB_loader.dataset.n_seq, self.trainB_loader.dataset.stride,
+                                self.noise_loader.dataset.n_seq, self.noise_loader.dataset.stride))
         else:
             train_transform = transforms.Compose([
                 transforms.RandomHorizontalFlip(),
@@ -194,6 +292,16 @@ class UGATIT(object) :
 
 
     def get_samples(self, is_test=False):
+        """Draws mel samples.
+
+        Args:
+            is_test (bool, optional): If True, draw from test dataloaders,
+                otherwise train dataloders. Defaults to False.
+
+        Returns:
+            tuple of torch.Tensor: two batches of mel spectrograms
+                from source A and source B dataloaders respectively
+        """
         if is_test:
             try:
                 real_A, (key_A, coord_A) = next(self.testA_iter)
@@ -218,7 +326,14 @@ class UGATIT(object) :
             except:
                 self.trainB_iter = iter(self.trainB_loader)
                 real_B, (key_B, coord_B) = next(self.trainB_iter)
-
+            if key_A not in self.trainA_visits:
+                self.trainA_visits[key_A] = 1
+            else:
+                self.trainA_visits[key_A] += 1
+            if key_B not in self.trainB_visits:
+                self.trainB_visits[key_B] = 1
+            else:
+                self.trainB_visits[key_B] += 1
         self.noise_A, self.noise_B = None, None
         if self.use_noise:  # add noise to data samples if required
             try:
@@ -237,6 +352,14 @@ class UGATIT(object) :
 
             self.noise_A = self.noise_A.to(self.device)
             self.noise_B = self.noise_B.to(self.device)
+            if key_NA not in self.noise_visits:
+                self.noise_visits[key_NA] = 1
+            else:
+                self.noise_visits[key_NA] += 1
+            if key_NB not in self.noise_visits:
+                self.noise_visits[key_NB] = 1
+            else:
+                self.noise_visits[key_NB] += 1
 
         # static_A = detect_static(unpad_mel_channels(inv_mel_transform(real_A), self.mel_channels))
         # static_B = detect_static(unpad_mel_channels(inv_mel_transform(real_B), self.mel_channels))
@@ -248,24 +371,46 @@ class UGATIT(object) :
 
 
     def noisy(self, mel, noise_prop, is_A=True):  # wrapper including printing
+        """Mixes noise into a mel spectrogram.
+        Noise is either drawn from noise_A or noise_B dataloader.
+
+        Args:
+            mel (torch.Tensor): source spectrogram
+            noise_prop (float): random proportion (0 to 1) of samples to add noise to
+            is_A (bool, optional): whether to use noise from source A (True) or source B. Defaults to True.
+
+        Returns:
+            torch.Tensor: spectrogram with mel and noise combined
+        """
         if noise_prop <= 0.:
             return mel
         if torch.rand([1]).item() < noise_prop:
             if self.adjust_noise_volume:
-                mel, noise = noise_normalizer(mel, self.noise_A, self.noise_B, self.noise_margin, self.scale_volume_noise)
+                mel, noise = noise_normalizer(mel, self.noise_A, self.noise_B, self.noise_margin, self.scale_source_volume_noise)
             else:
                 if is_A:
                     noise = self.noise_A
                 else:
                     noise = self.noise_B
             combined = add_mels(mel, noise)
-            if self.scale_volume_B > 0.:
-                combined = scale_volume(combined, 1. - self.scale_volume_B, 1. + self.scale_volume_B)
             return combined
         return mel
     
 
     def get_dis(self, sample, noise_prop, is_A=True):
+        """Discriminator output.
+
+        Args:
+            sample (torch.Tensor): mel spectrogram
+            noise_prop (float): random proportion of samples to add noise to before discriminator,
+                this is useful for normalizing when only one class has noise
+            is_A (bool, optional): whether to use A2B (True) or B2A generator. Defaults to True.
+
+        Returns:
+            tuple of torch.Tensor: G discriminator logit, G class activation mapping (CAM) logit,
+                L discriminator logit, L class activation mapping (CAM) logit...
+                G and L refer to greater and less? One is higher dimensional than the other
+        """
         tensor = self.noisy(sample, noise_prop, is_A)
         if is_A:
             G_logit, G_cam_logit, _ = self.disGA(tensor)
@@ -277,6 +422,17 @@ class UGATIT(object) :
 
 
     def get_gen(self, real_X, is_A=True):
+        """Generator output.
+
+        Args:
+            real_X (torch.Tensor): source mel spectrogram
+            is_A (bool, optional): whether to use A2B (True) or B2A generator. Defaults to True.
+
+        Returns:
+            tuple of torch.Tensor: fake sample, class activation mapping (CAM) logit, heatmap,
+                cycle gen sample (i.e. A2B2A), cycle gen heatmap,
+                identity gen sample (i.e. A2A), identity CAM logit, identity heatmap
+        """
         if is_A:
             genX2Y = self.genA2B
             genY2X = self.genB2A
@@ -301,6 +457,18 @@ class UGATIT(object) :
 
 
     def collate_examples(self, n_samples=None, is_A=True, is_test=False):
+        """Generates samples and combines resulting spectrograms to report model progress.
+
+        Args:
+            n_samples (int, optional): Number of samples to generate.
+                If None, use all samples in data loaders. Defaults to None.
+            is_A (bool, optional): Generate A to B if True, otherwise B to A. Defaults to True.
+            is_test (bool, optional): If True, use test dataloader, otherwise use train dataloader.
+                Defaults to False.
+
+        Returns:
+            torch.Tensor: generated mel spectrograms concatenated together
+        """
         if n_samples is None:
             if is_test:
                 if is_A:
@@ -316,9 +484,9 @@ class UGATIT(object) :
         for _ in range(n_samples):
             real_A, real_B = self.get_samples(is_test=is_test)
             if is_A:
-                real_X = real_A
+                real_X = self.gen_transform_A(real_A)
             else:
-                real_X = real_B
+                real_X = self.gen_transform_B(real_B)
             fake_X2Y, _, fake_X2Y_heatmap, fake_X2Y2X, fake_X2Y2X_heatmap, fake_X2X, _, fake_X2X_heatmap, \
                 = self.get_gen(real_X, is_A=is_A)
 
@@ -348,6 +516,8 @@ class UGATIT(object) :
 
 
     def train(self):
+        """Training loop.
+        """
         self.genA2B.train(), self.genB2A.train(), self.disGA.train(), self.disGB.train(), self.disLA.train(), self.disLB.train()
 
         # training loop
@@ -359,12 +529,14 @@ class UGATIT(object) :
                 self.D_optim.param_groups[0]['lr'] -= (self.dis_lr / (self.iteration // 2))
 
             real_A, real_B = self.get_samples()
+            
+            # Update D with noise
 
             # Update D
             self.D_optim.zero_grad()
 
-            fake_A2B, _, _ = self.genA2B(real_A)
-            fake_B2A, _, _ = self.genB2A(real_B)
+            fake_A2B, _, _ = self.genA2B(self.gen_transform_A(real_A))
+            fake_B2A, _, _ = self.genB2A(self.gen_transform_B(real_B))
             fake_A2B = strip_padded(fake_A2B, self.mel_channels)
             fake_B2A = strip_padded(fake_B2A, self.mel_channels)
 
@@ -375,27 +547,52 @@ class UGATIT(object) :
             # means compare A2B+noise with B+noise, and B2A+noise with A+noise
             real_GA_logit, real_GA_cam_logit, real_LA_logit, real_LA_cam_logit = self.get_dis(real_A, self.dis_noise_A, is_A=True)
             real_GB_logit, real_GB_cam_logit, real_LB_logit, real_LB_cam_logit = self.get_dis(real_B, self.dis_noise_B, is_A=False)
-            fake_GA_logit, fake_GA_cam_logit, fake_LA_logit, fake_LA_cam_logit = self.get_dis(fake_B2A, self.dis_noise_B, is_A=True)
-            fake_GB_logit, fake_GB_cam_logit, fake_LB_logit, fake_LB_cam_logit = self.get_dis(fake_A2B, self.dis_noise_A, is_A=False)
+            fake_GA_logit, fake_GA_cam_logit, fake_LA_logit, fake_LA_cam_logit = self.get_dis(fake_B2A, self.dis_noise_B2A, is_A=True)
+            fake_GB_logit, fake_GB_cam_logit, fake_LB_logit, fake_LB_cam_logit = self.get_dis(fake_A2B, self.dis_noise_A2B, is_A=False)
 
             # print('logits')
             # print(torch.std_mean(real_GA_logit), torch.std_mean(real_GA_cam_logit), torch.std_mean(real_LA_logit), torch.std_mean(real_LA_cam_logit))
             # print(torch.std_mean(real_GB_logit), torch.std_mean(real_GB_cam_logit), torch.std_mean(real_LB_logit), torch.std_mean(real_LB_cam_logit))
             # print(torch.std_mean(fake_GA_logit), torch.std_mean(fake_GA_cam_logit), torch.std_mean(fake_LA_logit), torch.std_mean(fake_LA_cam_logit))
             # print(torch.std_mean(fake_GB_logit), torch.std_mean(fake_GB_cam_logit), torch.std_mean(fake_LB_logit), torch.std_mean(fake_LB_cam_logit))
-            D_ad_loss_GA = self.MSE_loss(real_GA_logit, torch.ones_like(real_GA_logit).to(self.device)) + self.MSE_loss(fake_GA_logit, torch.zeros_like(fake_GA_logit).to(self.device))
-            D_ad_cam_loss_GA = self.MSE_loss(real_GA_cam_logit, torch.ones_like(real_GA_cam_logit).to(self.device)) + self.MSE_loss(fake_GA_cam_logit, torch.zeros_like(fake_GA_cam_logit).to(self.device))
-            D_ad_loss_LA = self.MSE_loss(real_LA_logit, torch.ones_like(real_LA_logit).to(self.device)) + self.MSE_loss(fake_LA_logit, torch.zeros_like(fake_LA_logit).to(self.device))
-            D_ad_cam_loss_LA = self.MSE_loss(real_LA_cam_logit, torch.ones_like(real_LA_cam_logit).to(self.device)) + self.MSE_loss(fake_LA_cam_logit, torch.zeros_like(fake_LA_cam_logit).to(self.device))
-            D_ad_loss_GB = self.MSE_loss(real_GB_logit, torch.ones_like(real_GB_logit).to(self.device)) + self.MSE_loss(fake_GB_logit, torch.zeros_like(fake_GB_logit).to(self.device))
-            D_ad_cam_loss_GB = self.MSE_loss(real_GB_cam_logit, torch.ones_like(real_GB_cam_logit).to(self.device)) + self.MSE_loss(fake_GB_cam_logit, torch.zeros_like(fake_GB_cam_logit).to(self.device))
-            D_ad_loss_LB = self.MSE_loss(real_LB_logit, torch.ones_like(real_LB_logit).to(self.device)) + self.MSE_loss(fake_LB_logit, torch.zeros_like(fake_LB_logit).to(self.device))
-            D_ad_cam_loss_LB = self.MSE_loss(real_LB_cam_logit, torch.ones_like(real_LB_cam_logit).to(self.device)) + self.MSE_loss(fake_LB_cam_logit, torch.zeros_like(fake_LB_cam_logit).to(self.device))
+            D_ad_loss_GA = self.MSE_loss(real_GA_logit, torch.ones_like(real_GA_logit).to(self.device)) \
+                + self.MSE_loss(fake_GA_logit, torch.zeros_like(fake_GA_logit).to(self.device))
+            D_ad_cam_loss_GA = self.MSE_loss(real_GA_cam_logit, torch.ones_like(real_GA_cam_logit).to(self.device)) \
+                + self.MSE_loss(fake_GA_cam_logit, torch.zeros_like(fake_GA_cam_logit).to(self.device))
+            D_ad_loss_LA = self.MSE_loss(real_LA_logit, torch.ones_like(real_LA_logit).to(self.device)) \
+                + self.MSE_loss(fake_LA_logit, torch.zeros_like(fake_LA_logit).to(self.device))
+            D_ad_cam_loss_LA = self.MSE_loss(real_LA_cam_logit, torch.ones_like(real_LA_cam_logit).to(self.device)) \
+                + self.MSE_loss(fake_LA_cam_logit, torch.zeros_like(fake_LA_cam_logit).to(self.device))
+            D_ad_loss_GB = self.MSE_loss(real_GB_logit, torch.ones_like(real_GB_logit).to(self.device)) \
+                + self.MSE_loss(fake_GB_logit, torch.zeros_like(fake_GB_logit).to(self.device))
+            D_ad_cam_loss_GB = self.MSE_loss(real_GB_cam_logit, torch.ones_like(real_GB_cam_logit).to(self.device)) \
+                + self.MSE_loss(fake_GB_cam_logit, torch.zeros_like(fake_GB_cam_logit).to(self.device))
+            D_ad_loss_LB = self.MSE_loss(real_LB_logit, torch.ones_like(real_LB_logit).to(self.device)) \
+                + self.MSE_loss(fake_LB_logit, torch.zeros_like(fake_LB_logit).to(self.device))
+            D_ad_cam_loss_LB = self.MSE_loss(real_LB_cam_logit, torch.ones_like(real_LB_cam_logit).to(self.device)) \
+                + self.MSE_loss(fake_LB_cam_logit, torch.zeros_like(fake_LB_cam_logit).to(self.device))
 
             D_loss_A = self.adv_weight * (D_ad_loss_GA + D_ad_cam_loss_GA + D_ad_loss_LA + D_ad_cam_loss_LA)
             D_loss_B = self.adv_weight * (D_ad_loss_GB + D_ad_cam_loss_GB + D_ad_loss_LB + D_ad_cam_loss_LB)
-
             Discriminator_loss = D_loss_A + D_loss_B
+
+            D_loss_noise = torch.zeros_like(Discriminator_loss)
+            if self.noise_weight_A > 0:
+                noise_GA_logit, noise_GA_cam_logit, noise_LA_logit, noise_LA_cam_logit = self.get_dis(self.noise_A, 0., is_A=True)
+                D_noise_loss_A = self.MSE_loss(noise_GA_logit, torch.zeros_like(noise_GA_logit).to(self.device)) \
+                    + self.MSE_loss(noise_GA_cam_logit, torch.zeros_like(noise_GA_cam_logit).to(self.device)) \
+                    + self.MSE_loss(noise_LA_logit, torch.zeros_like(noise_LA_logit).to(self.device)) \
+                    + self.MSE_loss(noise_LA_cam_logit, torch.zeros_like(noise_LA_cam_logit).to(self.device))
+                D_loss_noise += self.noise_weight_A * D_noise_loss_A
+            if self.noise_weight_B > 0:
+                noise_GB_logit, noise_GB_cam_logit, noise_LB_logit, noise_LB_cam_logit = self.get_dis(self.noise_B, 0., is_A=False)
+                D_noise_loss_B = self.MSE_loss(noise_GB_logit, torch.zeros_like(noise_GB_logit).to(self.device)) \
+                    + self.MSE_loss(noise_GB_cam_logit, torch.zeros_like(noise_GB_cam_logit).to(self.device)) \
+                    + self.MSE_loss(noise_LB_logit, torch.zeros_like(noise_LB_logit).to(self.device)) \
+                    + self.MSE_loss(noise_LB_cam_logit, torch.zeros_like(noise_LB_cam_logit).to(self.device))
+                D_loss_noise += self.noise_weight_B * D_noise_loss_B
+            Discriminator_loss += D_loss_noise
+
             if self.print_wandg and torch.isnan(Discriminator_loss):
                 print_weights_and_grads({
                     'genA2B': self.genA2B, 'genB2A': self.genB2A, 'disGA': self.disGA, 'disLA': self.disLA, 'disGB': self.disGB, 'disLB': self.disLB,
@@ -407,11 +604,11 @@ class UGATIT(object) :
             # Update G
             self.G_optim.zero_grad()
 
-            fake_A2B, fake_A2B_cam_logit, _, fake_A2B2A, _, fake_A2A, fake_A2A_cam_logit, _, = self.get_gen(real_A, is_A=True)
-            fake_B2A, fake_B2A_cam_logit, _, fake_B2A2B, _, fake_B2B, fake_B2B_cam_logit, _ = self.get_gen(real_B, is_A=False)
+            fake_A2B, fake_A2B_cam_logit, _, fake_A2B2A, _, fake_A2A, fake_A2A_cam_logit, _, = self.get_gen(self.gen_transform_A(real_A), is_A=True)
+            fake_B2A, fake_B2A_cam_logit, _, fake_B2A2B, _, fake_B2B, fake_B2B_cam_logit, _ = self.get_gen(self.gen_transform_B(real_B), is_A=False)
             # add background noise to fake if source has none
-            fake_GA_logit, fake_GA_cam_logit, fake_LA_logit, fake_LA_cam_logit = self.get_dis(fake_B2A, self.dis_noise_B, is_A=True)
-            fake_GB_logit, fake_GB_cam_logit, fake_LB_logit, fake_LB_cam_logit = self.get_dis(fake_A2B, self.dis_noise_A, is_A=False)
+            fake_GA_logit, fake_GA_cam_logit, fake_LA_logit, fake_LA_cam_logit = self.get_dis(fake_B2A, self.dis_noise_B2A, is_A=True)
+            fake_GB_logit, fake_GB_cam_logit, fake_LB_logit, fake_LB_cam_logit = self.get_dis(fake_A2B, self.dis_noise_A2B, is_A=False)
 
             G_ad_loss_GA = self.MSE_loss(fake_GA_logit, torch.ones_like(fake_GA_logit).to(self.device))
             G_ad_cam_loss_GA = self.MSE_loss(fake_GA_cam_logit, torch.ones_like(fake_GA_cam_logit).to(self.device))
@@ -448,7 +645,7 @@ class UGATIT(object) :
             self.genB2A.apply(self.Rho_clipper)
 
             # print debug info
-            print("[%5d/%5d] time: %4.4f d_loss: %.8f, g_loss: %.8f" % (step, self.iteration, time.time() - start_time, Discriminator_loss, Generator_loss))
+            print("[%5d/%5d] time: %4.2f d_loss_A: %.4f, d_loss_B: %.4f, d_loss_noise: %.4f, g_loss: %.4f" % (step, self.iteration, time.time() - start_time, D_loss_A, D_loss_B, D_loss_noise, Generator_loss))
             if self.print_wandg:
                 print(summarize(*wandg_stats(self.genA2B, self.genB2A, self.disGA, self.disLA, self.disGB, self.disLB)))
             if self.print_gen_layer >= 0:
@@ -478,6 +675,15 @@ class UGATIT(object) :
                     B2A = B2A.transpose(2, 1, 0, 3).reshape(self.img_size, -1)
                     self.save_mel(A2B, 'img', 'A2B_%07d.mel' % step)
                     self.save_mel(B2A, 'img', 'B2A_%07d.mel' % step)
+                    # save this to check loading stats
+                    def save_dict(d, name):
+                        with open(os.path.join(self.result_dir, self.dataset, 'img', 'visited' + name + '_%07d.txt' % step), 'w') as f:
+                            for key, val in d.items():
+                                if val > 0:
+                                    print(key, val, file=f)
+                    save_dict(self.trainA_visits, 'trainA')
+                    save_dict(self.trainB_visits, 'trainB')
+                    save_dict(self.noise_visits, 'noise')
                 else:
                     cv2.imwrite(os.path.join(self.result_dir, self.dataset, 'img', 'A2B_%07d.png' % step), A2B * 255.0)
                     cv2.imwrite(os.path.join(self.result_dir, self.dataset, 'img', 'B2A_%07d.png' % step), B2A * 255.0)
@@ -490,11 +696,24 @@ class UGATIT(object) :
                 self.save(self.result_dir, 'latest')
 
     def save_mel(self, mel, subdir, name):
+        """Saves a mel spectrogram tensor in a format that can be converted to audio.
+
+        Args:
+            mel (torch.Tensor): mel spectrogram after training normalizations (needs to be un-transformed)
+            subdir (str): directory under result_dir to save to
+            name (str): file name
+        """
         torch.save(
             unpad_mel_channels(torch.tensor(inv_mel_transform(mel)), self.mel_channels).numpy().squeeze(),
             os.path.join(self.result_dir, self.dataset, subdir, name))
 
     def save(self, dir, step):
+        """Saves model checkpoint.
+
+        Args:
+            dir (str): checkpoint directory
+            step (int): iteration number
+        """
         params = {}
         params['genA2B'] = self.genA2B.state_dict()
         params['genB2A'] = self.genB2A.state_dict()
@@ -508,6 +727,8 @@ class UGATIT(object) :
             torch.save(params, os.path.join(dir, self.dataset + '_params_%s.pt' % step))
 
     def load_latest_checkpoint(self):
+        """Loads model from latest checkpoint of result_dir.
+        """
         model_list = glob(os.path.join(self.result_dir, self.dataset, 'model', '*.pt'))
         if not len(model_list) == 0:
             model_list.sort()
@@ -519,6 +740,12 @@ class UGATIT(object) :
                 self.D_optim.param_groups[0]['lr'] -= (self.dis_lr / (self.iteration // 2)) * (self.start_iter - self.iteration // 2)
 
     def load(self, dir, step):
+        """Loads model checkpoint.
+
+        Args:
+            dir (str): checkpoint directory
+            step (int): iteration number
+        """
         params = torch.load(os.path.join(dir, self.dataset + '_params_%07d.pt' % step))
         self.genA2B.load_state_dict(params['genA2B'])
         self.genB2A.load_state_dict(params['genB2A'])
@@ -528,7 +755,8 @@ class UGATIT(object) :
         self.disLB.load_state_dict(params['disLB'])
 
     def test(self):
-
+        """Generates samples without training.
+        """
         self.genA2B.eval(), self.genB2A.eval()
         if self.mel_spectrogram:
             real_A_out, fake_A2A_out, fake_A2B_out, fake_A2B2A_out = None, None, None, None
@@ -590,7 +818,9 @@ class UGATIT(object) :
             self.save_mel(fake_B2A2B_out, 'test', 'fake_B2A2B_%d.mel' % n)
 
     def noise_test(self, n_samples):
-
+        """Experimental, gather statistical properties of sample + noise spectrograms (mean and variance)
+        to see if discriminators are using differences in volume as a "shortcut".
+        """
         def stats(mel):
             std, mean = torch.std_mean(mel)
             logits = self.get_dis(mel, self.dis_noise_B, is_A=True)
@@ -645,3 +875,121 @@ class UGATIT(object) :
                     ])
             torch.save(cols, os.path.join(self.result_dir, self.dataset, 'NOISE_test_result_table.pickle'))
             return cols
+
+    def run_dis_only(self):
+        """Use discriminator to classify new samples as A/B or noise.
+        May help in finding more training samples.
+        """
+        rows = []
+        base_dir = os.path.join('dataset', 'classify')
+        for subdir in os.listdir(base_dir):
+            data = MelFolder(os.path.join(base_dir, subdir), self.base_transform)
+            dataloader = SequentialMelLoader(data, self.img_size, stride=self.test_stride)
+            strip_before_name = len(os.path.join(base_dir, subdir))
+            strip_after_name = len('.mel')
+            for n, (sample, location) in enumerate(dataloader):
+                logit_tensors = self.get_dis(sample.to(self.device), 0., is_A=True)
+                name, position = location
+                name = name[strip_before_name: - strip_after_name]
+                if n % self.print_freq == 0:
+                    print(n, location, summarize(*logit_tensors, include_shape=True))
+                row = [subdir, name, position]
+                for logit in logit_tensors:
+                    row += [torch.min(logit).item(), torch.mean(logit).item(), torch.max(logit).item()]
+                rows.append(row)
+            df = pd.DataFrame(rows, columns=['subdir', 'name', 'position',
+                        'GA_logit_min', 'GA_logit_mean', 'GA_logit_max',
+                        'GA_cam_logit_min', 'GA_cam_logit_mean', 'GA_cam_logit_max',
+                        'LA_logit_min', 'LA_logit_mean', 'LA_logit_max',
+                        'LA_cam_logit_min', 'LA_cam_logit_mean', 'LA_cam_logit_max'])
+        df.to_csv(os.path.join(self.result_dir, 'ugatit-dis-outputs.csv'))
+
+    # following are 3 methods for generating contiguous sequences of audio
+    def inject_gen(self):
+        """Injects a piece of audio from previously generated sample
+        to subsequent sample, to encourage consistent sounding output.
+        """
+        fname = 'dataset/cohen160-with-interview/testB/motp-verses-padded.mel'
+        seed_pos = 4750
+        stride = self.img_size // 4
+        mel = torch.load(fname)
+        source = mel_transform(mel).unsqueeze(0).unsqueeze(0)
+        print(source.shape)
+        output = torch.zeros_like(source)
+        cur_img = source[:,:,:, seed_pos:seed_pos + self.img_size]
+        cur_pos = seed_pos
+        while cur_pos < source.shape[-1] - self.img_size * 2:
+            print(cur_pos, cur_img.shape)
+            with torch.no_grad():
+                gen_img, _, _ = self.genB2A(cur_img.to(self.device))
+                gen_img = gen_img.cpu()[:,:,:, stride:3*stride]
+            output[:,:,:, cur_pos+stride:cur_pos+3*stride] += gen_img  # these overlap
+            cur_img[:,:,:, :2*stride] = gen_img
+            cur_img[:,:,:, 2*stride:] = source[:,:,:, cur_pos+3*stride:cur_pos+5*stride]
+            cur_pos += stride
+        
+        final_out = inv_mel_transform(output / 2).squeeze()  # averaged over overlapping segments
+        torch.save(final_out, 'results/cohen160-with-interview/inject-gen-motp.mel')
+
+    def staggered_gen(self):
+        """Generates overlapping samples, averages via linear ramp in overlaps.
+        """
+        fname = 'dataset/cohen160-with-interview/testB/motp-chorus.mel'
+        n_overlaps = 4
+        stride = self.img_size // n_overlaps
+        mel = torch.load(fname)
+        source = mel_transform(mel).unsqueeze(0).unsqueeze(0)
+        print(source.shape)
+        output = torch.zeros_like(source)
+        half_size = self.img_size // 2
+        ramp = torch.arange(0, half_size, dtype=torch.float).expand(1,1,self.mel_channels, -1) / half_size
+        linear_ramp = torch.zeros(1, 1, self.mel_channels, self.img_size)
+        linear_ramp[:,:,:, :half_size] = ramp
+        linear_ramp[:,:,:, half_size:] = ramp.flip(3)
+        print(linear_ramp)
+        for i in range(0, source.shape[-1] - 160, stride):
+            with torch.no_grad():
+                gen_img, _, _ = self.genB2A(source[:,:,:,i:i+self.img_size].to(self.device))
+                gen_img = gen_img.cpu()
+            output[:,:,:,i:i+self.img_size] += torch.exp(inv_mel_transform(gen_img)) * linear_ramp
+
+        # averaged over overlapping segments
+        final_out = torch.log(output / n_overlaps).squeeze()
+        torch.save(final_out, 'results/cohen160-with-interview/staggered-gen-motp.mel')
+
+    def seeded_gen(self):
+        """Injects a separate piece of constant audio
+        to every sample, to encourage consistent sounding output.
+        """
+        fname = 'dataset/cohen160-with-interview/testB/motp-chorus.mel'
+        # seed_pos = 5100  # 0:59
+        seed_pos = 5100 - 3380 -160  # 0:18
+        n_overlaps = 2
+        seed_size = 40
+        gen_size = self.img_size - seed_size
+        stride = gen_size // n_overlaps
+        mel = torch.load(fname)
+        source = mel_transform(mel).unsqueeze(0).unsqueeze(0)
+        print(source.shape)
+        output = torch.zeros_like(source)
+        seed_img = source[:,:,:, seed_pos:seed_pos+self.img_size]  #include this at the end of each clip
+        torch.save(inv_mel_transform(seed_img).squeeze(), 'results/cohen160-with-interview/seed_img.mel')
+
+        half_size = gen_size // 2
+        ramp = torch.arange(0, half_size, dtype=torch.float).expand(1,1,self.mel_channels, -1) / half_size
+        linear_ramp = torch.zeros(1, 1, self.mel_channels, gen_size)
+        linear_ramp[:,:,:, :half_size] = ramp
+        linear_ramp[:,:,:, half_size:] = ramp.flip(3)
+        print(linear_ramp)
+        for i in range(0, source.shape[-1] - self.img_size, stride):
+            with torch.no_grad():
+                img_in = torch.zeros_like(seed_img)
+                img_in[:,:,:, :gen_size] = source[:,:,:, i:i + gen_size]
+                img_in[:,:,:, gen_size:] = seed_img[:,:,:, self.img_size // 2 - seed_size // 2:self.img_size // 2 + seed_size // 2]
+                gen_img, _, _ = self.genB2A(img_in.to(self.device))
+                gen_img = gen_img.cpu()[:,:,:, :gen_size]  # discard the seed
+            output[:,:,:,i:i+gen_size] += torch.exp(inv_mel_transform(gen_img)) * linear_ramp
+
+        # averaged over overlapping segments
+        final_out = torch.log(output / n_overlaps).squeeze()
+        torch.save(final_out, 'results/cohen160-with-interview/seeded-gen-motp.mel')

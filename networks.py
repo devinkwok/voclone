@@ -210,6 +210,7 @@ class Discriminator(nn.Module):
                       nn.LeakyReLU(0.2, True)]
 
         mult = 2 ** (n_layers - 2 - 1)
+        print(n_layers, ndf, mult, ndf * mult, ndf * mult * 2)
         model += [nn.ReflectionPad2d(1),
                   nn.utils.spectral_norm(
                   nn.Conv2d(ndf * mult, ndf * mult * 2, kernel_size=4, stride=1, padding=0, bias=True)),

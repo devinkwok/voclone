@@ -1,6 +1,4 @@
 #!/bin/bash
-
-# ## this is the big final model
 python main.py \
     --mel_spectrogram=True \
     --num_workers=1 \
@@ -19,7 +17,7 @@ python main.py \
     --print_input=True \
     --use_noise=True \
     --gen_noise_A=0. \
-    --gen_noise_B=1. \
+    --gen_noise_B=0. \
     --dis_noise_A=0. \
     --dis_noise_B=0. \
     --dis_noise_A2B=0. \

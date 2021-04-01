@@ -123,6 +123,12 @@ class MelFolder(DatasetFolder):
                                           target_transform=target_transform)
         self.imgs = self.samples
 
+    def __getitem__(self, index):
+        path, target = self.samples[index]
+        print(path, target)
+        sample, target = super().__getitem__(index)
+        return sample, path
+
 
 class SequentialMelLoader():
     def __init__(self, dataset, width, stride=None):
@@ -134,16 +140,16 @@ class SequentialMelLoader():
             self.stride = stride
 
     def generate_samples(self):
-        for mel, _ in iter(self.dataset):
+        for mel, path in iter(self.dataset):
             mel = mel.unsqueeze(0)
-            usable_len = mel.shape[3] - self.width
+            usable_len = mel.shape[-1] - self.width
             n_iters = ceil(usable_len / self.stride)
             target_len = n_iters * self.stride
             # pad so that stride divides length - width evenly
-            mel = F.pad(mel, pad=(0, target_len - usable_len), mode='constant', value=0)
+            mel = F.pad(mel, pad=(-1, target_len - usable_len), mode='constant', value=0)
             # need to add 1 to self.width to include the last iteration
             for i in range(0, mel.shape[3] - self.width + 1, self.stride):
-                yield mel[:,:,:, i:i + self.width], (i, i)
+                yield mel[:,:,:, i:i + self.width], (path, i)
 
     def __iter__(self):
         return self.generate_samples()

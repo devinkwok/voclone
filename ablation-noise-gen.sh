@@ -1,6 +1,4 @@
 #!/bin/bash
-
-# ## this is the big final model
 python main.py \
     --mel_spectrogram=True \
     --num_workers=1 \
@@ -37,7 +35,7 @@ python main.py \
     --scale_source_volume_noise=0.1 \
     --scale_target_volume_noise=0.25 \
     --noise_margin=0.02 \
-    --noise_weight_A=10. \
+    --noise_weight_A=0. \
     --noise_weight_B=0. \
     --w_sin_freq_A=1.5 \
     --h_sin_freq_A=3. \
