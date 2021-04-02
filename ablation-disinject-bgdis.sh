@@ -6,7 +6,7 @@ python main.py \
     --dataset=cohen160-with-interview \
     --iteration=600000 \
     --print_freq=1000 \
-    --save_freq=1000 \
+    --save_freq=5000 \
     --ch=64 \
     --n_res=4 \
     --n_dis=6 \
@@ -19,9 +19,9 @@ python main.py \
     --gen_noise_A=0. \
     --gen_noise_B=0. \
     --dis_noise_A=0. \
-    --dis_noise_B=0. \
+    --dis_noise_B=1. \
     --dis_noise_A2B=0. \
-    --dis_noise_B2A=0. \
+    --dis_noise_B2A=1. \
     --adv_weight=1 \
     --cycle_weight=1 \
     --identity_weight=10 \
@@ -35,7 +35,7 @@ python main.py \
     --scale_source_volume_noise=0.1 \
     --scale_target_volume_noise=0.25 \
     --noise_margin=0.02 \
-    --noise_weight_A=10. \
+    --noise_weight_A=20. \
     --noise_weight_B=0. \
     --w_sin_freq_A=1.5 \
     --h_sin_freq_A=3. \
