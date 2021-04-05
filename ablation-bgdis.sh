@@ -19,7 +19,7 @@ python main.py \
     --gen_noise_A=0. \
     --gen_noise_B=0. \
     --dis_noise_A=0. \
-    --dis_noise_B=0. \
+    --dis_noise_B=0.5 \
     --dis_noise_A2B=0. \
     --dis_noise_B2A=0. \
     --adv_weight=1 \
@@ -36,7 +36,7 @@ python main.py \
     --scale_target_volume_noise=0.25 \
     --noise_margin=0.02 \
     --noise_weight_A=20. \
-    --noise_weight_B=0. \
+    --noise_weight_B=1. \
     --w_sin_freq_A=1.5 \
     --h_sin_freq_A=3. \
     --w_sin_amp_A=0.06 \

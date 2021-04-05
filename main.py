@@ -72,8 +72,8 @@ def parse_args():
     parser.add_argument('--scale_source_volume_noise', type=float, default=0., help='Random scaling of noise to match sample volume prior to adding with sample when gen_noise_A/gen_noise_B is set')
     parser.add_argument('--scale_target_volume_noise', type=float, default=0., help='Random scaling (gen and dis) of noise samples when loaded')
     parser.add_argument('--noise_margin', type=float, default=0.03, help='Min mean diff between noise and B samples to trigger scaling')
-    parser.add_argument('--noise_weight_A', type=float, default=0, help='Weight for discriminator A differentiation between noise and target')
-    parser.add_argument('--noise_weight_B', type=float, default=0, help='Weight for discriminator B differentiation between noise and target')
+    parser.add_argument('--noise_weight_A', type=float, default=0, help='Weight for discriminator A differentiation of noise as negative sample')
+    parser.add_argument('--noise_weight_B', type=float, default=0, help='Weight for discriminator B differentiation of noise as negative sample')
     parser.add_argument('--NOISE_n_samples', type=int, default=100, help='This is an experiment to check effect of noise distribution on loss, set `phase` to NOISE_test')
 
     parser.add_argument('--augment_volume', type=str2bool, default=False, help='Augment data at source with sinusoidal volume changes, salt and pepper noise, and stretching')

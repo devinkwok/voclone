@@ -335,6 +335,7 @@ class UGATIT(object) :
             else:
                 self.trainB_visits[key_B] += 1
         self.noise_A, self.noise_B = None, None
+        real_A_noisy, real_B_noisy = None, None
         if self.use_noise:  # add noise to data samples if required
             try:
                 self.noise_A, (key_NA, coord_NA) = next(self.noise_iter)
@@ -347,8 +348,8 @@ class UGATIT(object) :
                 self.noise_iter = iter(self.noise_loader)
                 self.noise_B, (key_NB, coord_NB) = next(self.noise_iter)
             if not is_test:
-                real_A = self.noisy(real_A, self.gen_noise_A, True)
-                real_B = self.noisy(real_B, self.gen_noise_B, False)
+                real_A_noisy = self.noisy(real_A, self.gen_noise_A, True)
+                real_B_noisy = self.noisy(real_B, self.gen_noise_B, False)
 
             self.noise_A = self.noise_A.to(self.device)
             self.noise_B = self.noise_B.to(self.device)
@@ -361,13 +362,19 @@ class UGATIT(object) :
             else:
                 self.noise_visits[key_NB] += 1
 
-        # static_A = detect_static(unpad_mel_channels(inv_mel_transform(real_A), self.mel_channels))
-        # static_B = detect_static(unpad_mel_channels(inv_mel_transform(real_B), self.mel_channels))
+        # static_A = detect_static(unpad_mel_channels(inv_mel_transform(real_A_noisy), self.mel_channels))
+        # static_B = detect_static(unpad_mel_channels(inv_mel_transform(real_B_noisy), self.mel_channels))
         # if static_A is not None:
         #     print("                      !!!!", key_A, coord_A, static_A)
         # if static_B is not None:
         #     print("                      !!!!", key_B, coord_B, key_NB, coord_NB, static_B)
-        return real_A.to(self.device), real_B.to(self.device)
+
+        # returning noisy and non-noisy is a temporary hack to minimize code changes for implementing BG dis
+        if real_A_noisy is None or real_B_noisy is None:
+            real_A = real_A.to(self.device)
+            real_B = real_B.to(self.device)
+            return real_A, real_B, real_A, real_B
+        return real_A_noisy.to(self.device), real_B_noisy.to(self.device), real_A.to(self.device), real_B.to(self.device)
 
 
     def noisy(self, mel, noise_prop, is_A=True):  # wrapper including printing
@@ -419,6 +426,34 @@ class UGATIT(object) :
             G_logit, G_cam_logit, _ = self.disGB(tensor)
             L_logit, L_cam_logit, _ = self.disLB(tensor)
         return G_logit, G_cam_logit, L_logit, L_cam_logit
+
+
+    def dis_loss(self, sample, noise_prop, is_A=True, is_positive=True):
+        """Discriminator loss.
+
+        Args:
+            sample (torch.Tensor): mel spectrogram
+            noise_prop (float): random proportion of samples to add noise to before discriminator,
+                this is useful for normalizing when only one class has noise
+            is_A (bool, optional): whether to use A2B (True) or B2A generator. Defaults to True.
+            is_positive (bool, optional): Whether discriminator should classify as
+                positive (ones) or negative (zeros) example. Defaults to True.
+
+        Returns:
+            torch.Tensor: Zero dimensional loss value.
+        """
+        GX_logit, GX_cam_logit, LX_logit, LX_cam_logit = self.get_dis(sample, noise_prop, is_A=True)
+        if is_positive:
+            D_loss = self.MSE_loss(GX_logit, torch.ones_like(GX_logit).to(self.device)) \
+                + self.MSE_loss(GX_cam_logit, torch.ones_like(GX_cam_logit).to(self.device)) \
+                + self.MSE_loss(LX_logit, torch.ones_like(LX_logit).to(self.device)) \
+                + self.MSE_loss(LX_cam_logit, torch.ones_like(LX_cam_logit).to(self.device))
+        else:
+            D_loss = self.MSE_loss(GX_logit, torch.zeros_like(GX_logit).to(self.device)) \
+                + self.MSE_loss(GX_cam_logit, torch.zeros_like(GX_cam_logit).to(self.device)) \
+                + self.MSE_loss(LX_logit, torch.zeros_like(LX_logit).to(self.device)) \
+                + self.MSE_loss(LX_cam_logit, torch.zeros_like(LX_cam_logit).to(self.device))
+        return D_loss
 
 
     def get_gen(self, real_X, is_A=True):
@@ -482,7 +517,7 @@ class UGATIT(object) :
                     n_samples = len(self.trainB_loader)
         X2Y = None
         for _ in range(n_samples):
-            real_A, real_B = self.get_samples(is_test=is_test)
+            real_A, real_B, _, _ = self.get_samples(is_test=is_test)
             if is_A:
                 real_X = self.gen_transform_A(real_A)
             else:
@@ -528,10 +563,11 @@ class UGATIT(object) :
                 self.G_optim.param_groups[0]['lr'] -= (self.gen_lr / (self.iteration // 2))
                 self.D_optim.param_groups[0]['lr'] -= (self.dis_lr / (self.iteration // 2))
 
-            real_A, real_B = self.get_samples()
+            """BG injection pre-gen
+            """
+            # returning noisy and non-noisy is a temporary hack to minimize code changes for implementing BG dis
+            real_A, real_B, real_A_no_noise, real_B_no_noise = self.get_samples()
             
-            # Update D with noise
-
             # Update D
             self.D_optim.zero_grad()
 
@@ -540,57 +576,28 @@ class UGATIT(object) :
             fake_A2B = strip_padded(fake_A2B, self.mel_channels)
             fake_B2A = strip_padded(fake_B2A, self.mel_channels)
 
+            """BG injection pre-dis
+            """
             # if dis_noise_A > 0., this means add noise to A, or that A has no noise and B has noise
             # then A2B will have no noise while B2A will have noise, so compare A2B+noise with B, and B2A with A+noise
             # vice versa if B has no noise and A has noise
             # if both A and B have no noise, then setting both dis_noise_A and dis_noise_B > 0.
             # means compare A2B+noise with B+noise, and B2A+noise with A+noise
-            real_GA_logit, real_GA_cam_logit, real_LA_logit, real_LA_cam_logit = self.get_dis(real_A, self.dis_noise_A, is_A=True)
-            real_GB_logit, real_GB_cam_logit, real_LB_logit, real_LB_cam_logit = self.get_dis(real_B, self.dis_noise_B, is_A=False)
-            fake_GA_logit, fake_GA_cam_logit, fake_LA_logit, fake_LA_cam_logit = self.get_dis(fake_B2A, self.dis_noise_B2A, is_A=True)
-            fake_GB_logit, fake_GB_cam_logit, fake_LB_logit, fake_LB_cam_logit = self.get_dis(fake_A2B, self.dis_noise_A2B, is_A=False)
-
-            # print('logits')
-            # print(torch.std_mean(real_GA_logit), torch.std_mean(real_GA_cam_logit), torch.std_mean(real_LA_logit), torch.std_mean(real_LA_cam_logit))
-            # print(torch.std_mean(real_GB_logit), torch.std_mean(real_GB_cam_logit), torch.std_mean(real_LB_logit), torch.std_mean(real_LB_cam_logit))
-            # print(torch.std_mean(fake_GA_logit), torch.std_mean(fake_GA_cam_logit), torch.std_mean(fake_LA_logit), torch.std_mean(fake_LA_cam_logit))
-            # print(torch.std_mean(fake_GB_logit), torch.std_mean(fake_GB_cam_logit), torch.std_mean(fake_LB_logit), torch.std_mean(fake_LB_cam_logit))
-            D_ad_loss_GA = self.MSE_loss(real_GA_logit, torch.ones_like(real_GA_logit).to(self.device)) \
-                + self.MSE_loss(fake_GA_logit, torch.zeros_like(fake_GA_logit).to(self.device))
-            D_ad_cam_loss_GA = self.MSE_loss(real_GA_cam_logit, torch.ones_like(real_GA_cam_logit).to(self.device)) \
-                + self.MSE_loss(fake_GA_cam_logit, torch.zeros_like(fake_GA_cam_logit).to(self.device))
-            D_ad_loss_LA = self.MSE_loss(real_LA_logit, torch.ones_like(real_LA_logit).to(self.device)) \
-                + self.MSE_loss(fake_LA_logit, torch.zeros_like(fake_LA_logit).to(self.device))
-            D_ad_cam_loss_LA = self.MSE_loss(real_LA_cam_logit, torch.ones_like(real_LA_cam_logit).to(self.device)) \
-                + self.MSE_loss(fake_LA_cam_logit, torch.zeros_like(fake_LA_cam_logit).to(self.device))
-            D_ad_loss_GB = self.MSE_loss(real_GB_logit, torch.ones_like(real_GB_logit).to(self.device)) \
-                + self.MSE_loss(fake_GB_logit, torch.zeros_like(fake_GB_logit).to(self.device))
-            D_ad_cam_loss_GB = self.MSE_loss(real_GB_cam_logit, torch.ones_like(real_GB_cam_logit).to(self.device)) \
-                + self.MSE_loss(fake_GB_cam_logit, torch.zeros_like(fake_GB_cam_logit).to(self.device))
-            D_ad_loss_LB = self.MSE_loss(real_LB_logit, torch.ones_like(real_LB_logit).to(self.device)) \
-                + self.MSE_loss(fake_LB_logit, torch.zeros_like(fake_LB_logit).to(self.device))
-            D_ad_cam_loss_LB = self.MSE_loss(real_LB_cam_logit, torch.ones_like(real_LB_cam_logit).to(self.device)) \
-                + self.MSE_loss(fake_LB_cam_logit, torch.zeros_like(fake_LB_cam_logit).to(self.device))
-
-            D_loss_A = self.adv_weight * (D_ad_loss_GA + D_ad_cam_loss_GA + D_ad_loss_LA + D_ad_cam_loss_LA)
-            D_loss_B = self.adv_weight * (D_ad_loss_GB + D_ad_cam_loss_GB + D_ad_loss_LB + D_ad_cam_loss_LB)
+            D_loss_A = self.adv_weight * (
+                    self.dis_loss(real_A, self.dis_noise_A, is_A=True, is_positive=True) \
+                    + self.dis_loss(fake_B2A, self.dis_noise_B2A, is_A=True, is_positive=False))
+            D_loss_B = self.adv_weight * (
+                    self.dis_loss(real_B, self.dis_noise_B, is_A=False, is_positive=True) \
+                    + self.dis_loss(fake_A2B, self.dis_noise_A2B, is_A=False, is_positive=False))
             Discriminator_loss = D_loss_A + D_loss_B
 
+            """BG dis loss
+            """
             D_loss_noise = torch.zeros_like(Discriminator_loss)
             if self.noise_weight_A > 0:
-                noise_GA_logit, noise_GA_cam_logit, noise_LA_logit, noise_LA_cam_logit = self.get_dis(self.noise_A, 0., is_A=True)
-                D_noise_loss_A = self.MSE_loss(noise_GA_logit, torch.zeros_like(noise_GA_logit).to(self.device)) \
-                    + self.MSE_loss(noise_GA_cam_logit, torch.zeros_like(noise_GA_cam_logit).to(self.device)) \
-                    + self.MSE_loss(noise_LA_logit, torch.zeros_like(noise_LA_logit).to(self.device)) \
-                    + self.MSE_loss(noise_LA_cam_logit, torch.zeros_like(noise_LA_cam_logit).to(self.device))
-                D_loss_noise += self.noise_weight_A * D_noise_loss_A
+                D_loss_noise += self.noise_weight_A * self.dis_loss(self.noise_A, 0., is_A=True, is_positive=False)
             if self.noise_weight_B > 0:
-                noise_GB_logit, noise_GB_cam_logit, noise_LB_logit, noise_LB_cam_logit = self.get_dis(self.noise_B, 0., is_A=False)
-                D_noise_loss_B = self.MSE_loss(noise_GB_logit, torch.zeros_like(noise_GB_logit).to(self.device)) \
-                    + self.MSE_loss(noise_GB_cam_logit, torch.zeros_like(noise_GB_cam_logit).to(self.device)) \
-                    + self.MSE_loss(noise_LB_logit, torch.zeros_like(noise_LB_logit).to(self.device)) \
-                    + self.MSE_loss(noise_LB_cam_logit, torch.zeros_like(noise_LB_cam_logit).to(self.device))
-                D_loss_noise += self.noise_weight_B * D_noise_loss_B
+                D_loss_noise += self.noise_weight_B * self.dis_loss(self.noise_B, 0., is_A=False, is_positive=False)
             Discriminator_loss += D_loss_noise
 
             if self.print_wandg and torch.isnan(Discriminator_loss):
@@ -606,18 +613,9 @@ class UGATIT(object) :
 
             fake_A2B, fake_A2B_cam_logit, _, fake_A2B2A, _, fake_A2A, fake_A2A_cam_logit, _, = self.get_gen(self.gen_transform_A(real_A), is_A=True)
             fake_B2A, fake_B2A_cam_logit, _, fake_B2A2B, _, fake_B2B, fake_B2B_cam_logit, _ = self.get_gen(self.gen_transform_B(real_B), is_A=False)
-            # add background noise to fake if source has none
-            fake_GA_logit, fake_GA_cam_logit, fake_LA_logit, fake_LA_cam_logit = self.get_dis(fake_B2A, self.dis_noise_B2A, is_A=True)
-            fake_GB_logit, fake_GB_cam_logit, fake_LB_logit, fake_LB_cam_logit = self.get_dis(fake_A2B, self.dis_noise_A2B, is_A=False)
-
-            G_ad_loss_GA = self.MSE_loss(fake_GA_logit, torch.ones_like(fake_GA_logit).to(self.device))
-            G_ad_cam_loss_GA = self.MSE_loss(fake_GA_cam_logit, torch.ones_like(fake_GA_cam_logit).to(self.device))
-            G_ad_loss_LA = self.MSE_loss(fake_LA_logit, torch.ones_like(fake_LA_logit).to(self.device))
-            G_ad_cam_loss_LA = self.MSE_loss(fake_LA_cam_logit, torch.ones_like(fake_LA_cam_logit).to(self.device))
-            G_ad_loss_GB = self.MSE_loss(fake_GB_logit, torch.ones_like(fake_GB_logit).to(self.device))
-            G_ad_cam_loss_GB = self.MSE_loss(fake_GB_cam_logit, torch.ones_like(fake_GB_cam_logit).to(self.device))
-            G_ad_loss_LB = self.MSE_loss(fake_LB_logit, torch.ones_like(fake_LB_logit).to(self.device))
-            G_ad_cam_loss_LB = self.MSE_loss(fake_LB_cam_logit, torch.ones_like(fake_LB_cam_logit).to(self.device))
+            # dis_noise_B2A and dis_noise_A2B add background noise to fake if source has none
+            G_ad_loss_A = self.dis_loss(fake_B2A, self.dis_noise_B2A, is_A=True, is_positive=True)
+            G_ad_loss_B = self.dis_loss(fake_A2B, self.dis_noise_A2B, is_A=False, is_positive=True)
 
             G_recon_loss_A = self.L1_loss(fake_A2B2A, real_A)
             G_recon_loss_B = self.L1_loss(fake_B2A2B, real_B)
@@ -628,8 +626,8 @@ class UGATIT(object) :
             G_cam_loss_A = self.BCE_loss(fake_B2A_cam_logit, torch.ones_like(fake_B2A_cam_logit).to(self.device)) + self.BCE_loss(fake_A2A_cam_logit, torch.zeros_like(fake_A2A_cam_logit).to(self.device))
             G_cam_loss_B = self.BCE_loss(fake_A2B_cam_logit, torch.ones_like(fake_A2B_cam_logit).to(self.device)) + self.BCE_loss(fake_B2B_cam_logit, torch.zeros_like(fake_B2B_cam_logit).to(self.device))
 
-            G_loss_A =  self.adv_weight * (G_ad_loss_GA + G_ad_cam_loss_GA + G_ad_loss_LA + G_ad_cam_loss_LA) + self.cycle_weight * G_recon_loss_A + self.identity_weight * G_identity_loss_A + self.cam_weight * G_cam_loss_A
-            G_loss_B = self.adv_weight * (G_ad_loss_GB + G_ad_cam_loss_GB + G_ad_loss_LB + G_ad_cam_loss_LB) + self.cycle_weight * G_recon_loss_B + self.identity_weight * G_identity_loss_B + self.cam_weight * G_cam_loss_B
+            G_loss_A =  self.adv_weight * G_ad_loss_A + self.cycle_weight * G_recon_loss_A + self.identity_weight * G_identity_loss_A + self.cam_weight * G_cam_loss_A
+            G_loss_B = self.adv_weight * G_ad_loss_B + self.cycle_weight * G_recon_loss_B + self.identity_weight * G_identity_loss_B + self.cam_weight * G_cam_loss_B
 
             Generator_loss = G_loss_A + G_loss_B
             if self.print_wandg and torch.isnan(Generator_loss):
