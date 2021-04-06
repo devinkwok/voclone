@@ -1,1 +1,1 @@
-../voclone-tools/iterseq.py
+voclone-tools/iterseq.py

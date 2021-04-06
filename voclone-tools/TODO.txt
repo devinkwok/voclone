@@ -1,0 +1,308 @@
+IMPORTANT NOTE MARCH 28 2021:
+ImageFolder does NOT recompute transforms for every epoch, so data augmentation at that point is useless!
+- addendum: the code no longer uses ImageFolder so this is no problem
+
+
+Competing approaches:
+    https://github.com/marcoppasini/MelGAN-VC/blob/master/MelGAN_VC.ipynb
+        this is basically TravelGAN?
+        definitely train this
+    https://github.com/Yolanda-Gao/VoiceGANmodel
+        this sounds worse than the above
+    https://arxiv.org/pdf/1910.11997.pdf
+        this is Tacotron2 with rhythm/pitch adaptation, but the naturalness shouldn't be as good because it is conditioned on text input, not audio
+        doesn't work for my use case since I really do need style transfer to keep source's inflections
+    https://arxiv.org/abs/2005.09178
+        all of this 1st author's audio samples are suspiciously good, and no code is available
+        need to investigate further https://github.com/liusongxiang
+    http://www.kecl.ntt.co.jp/people/kaneko.takuhiro/projects/stargan-vc2/index.html
+        original StarGAN paper is well cited, seems SOTA
+        this focus is on multi domain conversion - it is likely the quality will be worse than 1 to 1 transfer
+    https://openreview.net/forum?id=HJlk-eHFwH
+        AdaGAN is closest to U-GAT-IT, not sure how good the samples sound
+        was rejected by ICLR 2020
+        is code available?
+    voice cloning: Arik et al., 2018; Nachmani et al., 2018; Jia et al., 2018
+        these are all conditioned on small samples, quality is low
+    https://github.com/ryokamoi/ppg_vc
+        poor quality, quite old and not SOTA
+    https://github.com/pritishyuvraj/Voice-Conversion-GAN
+        audio samples?
+    https://animatedsound.com/research/2018.02_texturecnn/#weightsninput_ref
+        interesting theoretical paper, basically claims that image models suck for audio style transfer
+        but they also make strange transfers e.g. rooster <-> human
+        these transfers don't make much semantic sense
+    https://link.springer.com/chapter/10.1007%2F978-3-030-29891-3_29
+        this is basically what I am doing (directly applying image models to audio)
+        except the results are terrible
+        also not using SOTA models (they use Gatys et al, a modification, and CycleGAN)
+
+see https://towardsdatascience.com/whats-wrong-with-spectrograms-and-cnns-for-audio-processing-311377d7ccd
+
+other links:
+    https://scholar.google.com/scholar?hl=en&as_sdt=0%2C39&q=audio+style+transfer&btnG=
+    https://openreview.net/forum?id=BybQ7zWCb&noteId=BybQ7zWCb
+    https://ieeexplore.ieee.org/abstract/document/9053521
+    https://ieeexplore.ieee.org/abstract/document/9054734
+    https://ieeexplore.ieee.org/abstract/document/8461282
+    https://arxiv.org/abs/1808.08311
+    https://ieeexplore.ieee.org/abstract/document/8461711
+    https://arxiv.org/abs/1801.01589
+    https://arxiv.org/pdf/2005.09178.pdf
+    https://arxiv.org/pdf/2005.07815.pdf
+    https://arxiv.org/pdf/1905.05879.pdf
+    https://towardsdatascience.com/whats-wrong-with-spectrograms-and-cnns-for-audio-processing-311377d7ccd
+
+
+
+
+
+
+
+
+
+
+To synthesize with wavenet vocoder:
+    - Put wav files into `{data dir}/wavs`.
+    - Put wav filenames into `{data dir}/metadata.csv` in the following format:
+    - `{filename without suffix .wav}|{transcription can be left empty}|{transcription also can be left empty}`
+    - Run `python preprocess.py ljspeech {data dir} {spectrogram dir} --preset={json hparams file}` where {json hparams file} is 20180510_mixture_lj_checkpoint_step000320000_ema.json
+    - Run `python synthesis.py {model checkpoint} {output dir} --conditional={spectrogram dir}/{spectrogram filename}.npy --preset={json hparams file}` where {model checkpoint} is 20180510_mixture_lj_checkpoint_step000320000_ema.pth
+    - Note: the npy files are numpy arrays saved using the builtin function in numpy
+
+wavenet vocoder has very low quality in the low registers, may need fine tuning?
+
+** need to resample audio to mono 22050Hz before converting to mel spectrogram
+cd {dir}
+mkdir resampled
+for file in *.wav
+do
+ffmpeg -i "$file" -ar 22050 -ac 1 "resampled/$file"
+done
+
+
+need to test waveglow with its own mel spectrogram generating code
+    - use `python preprocess_audio2mel.py --dataset-path={data dir}/wavs --wav-files={data dir}/metadata.csv --mel-files={spectrogram dir}`
+    e.g.
+        python preprocess_audio2mel.py --dataset-path=/home/devin/data/ml/test_ljspeech/wavs --wav-files=/home/devin/data/ml/test_ljspeech/waveglow_metadata.csv --mel-files=/home/devin/data/ml/test_ljspeech/mel_metadata.csv
+        python preprocess_audio2mel.py --dataset-path=/home/devin/data/ml/ravdess_mel_gendersplit --wav-files=/home/devin/data/ml/ravdess_mel_gendersplit/waveglow_preprocess_metadata.csv --mel-files=/home/devin/data/ml/ravdess_mel_gendersplit/mel_metadata.csv
+        python preprocess_audio2mel.py --dataset-path=/home/devin/data/ml/cohen --wav-files=/home/devin/data/ml/cohen/waveglow_preprocess_metadata.csv --mel-files=/home/devin/data/ml/cohen/mel_metadata.csv
+
+running UGATIT
+    python main.py --iteration=1000 --print_freq=100 --save_freq=100 --ch=28 --n_res=2 --n_dis=3 --img_size=100
+
+Training progress
+    python main.py \
+        --mel_spectrogram=True \
+        --light=True \
+        --dataset=ravdess_mel_gendersplit_normalized \
+        --iteration=1000000 \
+        --print_freq=500 \
+        --save_freq=500 \
+        --ch=64 \
+        --n_res=4 \
+        --n_dis=4 \
+        --img_size=80 \
+        --img_ch=1 \
+        --print_wandg=True \
+        --print_input=True \
+        --resume=True \
+        --use_noise=True \
+        --gen_noise_A=0.5 \
+        --dis_noise_B=0.5 \
+    to 80000
+        gendersplit not normalized
+    to 160000
+        gendersplit normalized
+    to 190000
+        gendersplit normalized
+        0.5 noise added to A (M) before gen
+        0.5 noise added to B (F) to compare against A
+    to 340000
+        same as above (identity is too strong)
+    restart from 160000
+        refactor of gendersplit normalized
+    to 235000
+        same as above (identity also too strong)
+    to 310000
+        increased adv weight from 1 to 3
+        reduced identity and cycle weight from 10 to 5
+        M2F works well, but F2M does not
+        the identity and cycle components use L1 loss
+        adding noise to these is incorrect
+        try running with gen noise added to both sides (different noises for A and B)
+    restart from 160000 to 250000
+        noise in both gens
+        now F2M works but M2F does not
+        may be due to random collapse of discriminators
+    try retraining from scratch wtih both gen noises, normalized data
+
+Data pipeline
+    resample-wavs.sh
+    make_intervals.py --operation generate
+    make_intervals.py --operation split
+
+Noise Distribution Notes:
+    A mean: -4.5 (0.5)
+        A std 1.9
+    noise mean: -5.5 (1.0)
+        noise std 2.08
+    B mean: -5.9 (0.5)
+        B std: 2.11
+    B is quieter than the noise on average
+    noise has more variance of its mean than A/B
+    A is more consistently distributed than B (less variance)
+    can interpolate volume by approx factor of 0.8-1.2 (don't exceed clipping threshold)
+
+Error in CouncilGAN:
+    iteration 74704
+        networks.py line 653 (called by 520, 461, 422, 401, 202 decode())
+        RuntimeError: weight should contain 512 elements not 768
+        code:
+        out = F.batch_norm(
+            x_reshaped, running_mean, running_var, self.weight, self.bias,
+            True, self.momentum, self.eps)
+    
+the CouncilGAN error hasn't appeared against
+
+UGATIT seems to max out around 200-300k iterations with current dataset, at 500k+ iterations it has clearly overfit (monotone pitch voices, missing phonemes)
+UGATIT at 1/4 dataset maxes out around 80k-100k, at 200k it exhibits similar overfitting
+Idea: train discriminator to label noises as false and targets as true
+(by adding extra loss term)
+on CouncilGAN, adding no noise and only having noise dis fails to make generator converge (70k iterations, a lot of extraneous noise in generated samples, doesn't preserve phonemes)
+on UGATIT (small 2GB model), adding no noise and only having noise dis causes generator to insert noise into source-to-target translation
+adding some noise (0.5 on fake source-to-target for target dis, 0.5 on real source for source dis) reduces this but there is still some generated noise
+conclusion:
+- still need to inject noise
+- how much of an effect does dis noise add? seems to help (25-90k UGATIT 2GB model iterations sound fairly good, but no exact comparison yet)
+- injecting noise pre-generation can actually be beneficial as it suppresses noise insertion?
+
+experiments
+oct 25 - (main) 256 channels
+    - improves audio clarity, do 160 ch as a compromise
+oct 25 - (long) no noise injection, large noise weight
+    - works really well, a little noise remains so maybe inject some noise
+oct 26 - (main) council with large noise weight, mask weight
+    - only 25k iterations, doesn't work that well, need to investigate council model further
+oct 26 - (long) imbalanced dataset (large A small B)
+    - inaccurate phonemes for A2B, B2A sounds good but has some extra noise
+oct 26 - (long) gen target is heavily augmented, dis target is unaugmented
+    - doesn't work well for some reason, gets worse as it goes
+- (long) time stretch augments, channel translation augments, volume augments
+    TODO get the engineering done
+
+- (main) melganvc with noise and proper data inject
+
+
+- (short) 0 to 1 mel transform (mel_transform_new)
+    
+
+
+- (long) pretrained dis
+- (long) add other voices
+
+
+proposed paper:
+- eval 2 image models (maybe +1 without AdaGAN? i.e. CycleGAN), 1-2 ref audio models
+- ablation study nothing, inject noise, train dis on noise, both, (with/without data augment?)
+- 4x4 = 16 models total, train each for ~24h ~200k iterations
+- major results
+    1) image models can do audio with little/no modification
+    2) noise segmentation can be learned by injecting background noise distribution to gen or dis, (but dis is better?)
+- other minor results: downsample from more channels,
+imbalanced data augmentation (apply to gen, not dis)
+
+
+notes:
+ - combining inject noise and train dis on noise may be counterproductive
+ - this is because of dependence on CAM - injecting noise makes target/noise dis CAM loss high in noisy regions which cannot and should not be modified by generator
+ - hypothesis: reducing CAM loss will improve
+ - alternatively, separate dis into 2 separate dis: one that separates target/noise+source for adversarial training, one that separates target+noise/source for CAM
+ - or manipulate CAM using silences
+
+TODO
+    - get background for interviews using 0.0001 threshold make-intervals (take noise)
+    - get faster audio player to review samples
+data pipeline
+    - remove silences if applicable using `make_intervals.py --operation generate`
+    - convert to mel 80 ch using `wav2mel.sh`
+    - run dis using UGATIT from gtx960
+    - get predictions from dis output using R linear model
+    - convert predictions to intervals using `make_intervals.py --operation classify`
+    - split using intervals at upper (>0.7) and lower (<0.3) thresholds separately `make_intervals.py --operation split`
+    - verify positives and negatives
+    - convert split wav to mel 160 ch, insert into train dataset
+
+final training regime
+    - noise_dis at 5-10 with noise inject
+    - then ramp up to 100 and 1000, taking out gen_B noise inject
+    - finally, lower cycle weight
+
+TODO
+    - check linear model on cohenlive
+    - make source data
+    - classify more albums
+    
+TODO
+    - automate loading all existing models and running inference
+        - use 380k to 460k models
+    - train best model on Vox only until convergence
+    - try averaging across different model versions - too bland
+    - try seeding model by splitting into small nuggets, combine part of the gen out from one nugget to the next prior to gen
+    - average in time by multiplying each img by linear ramp 0 to 1 to 0, then combine half-overlapping pairs of audio together (sum)
+
+
+https://melogan.bandcamp.com/track/man-of-the-people
+https://youtu.be/0CD110ZNt3Y
+
+/u/sagaciux/
+https://www.reddit.com/r/Music/
+Melogan - Man of the People [Folk/Protest] ft. "Leonard Cohen"
+
+https://www.reddit.com/r/indie/
+Melogan - Man of the People [Folk/Protest] - ft. "Leonard Cohen"
+
+A song for our time, featuring the reconstructed voice of Leonard Cohen.
+
+
+
+
+/u/sagaciux/
+https://www.reddit.com/r/leonardcohen/
+Leonard Cohen's voice deepfake - Man of the people
+
+Wrote a song inspired by Leonard Cohen... a little too literally.
+
+
+/u/a_measure_of_meaning
+https://www.reddit.com/r/MachineLearning
+[P] Bringing Leonard Cohen back with voice style transfer
+
+A "deep fake" of Leonard Cohen's voice for this song:
+https://youtu.be/0CD110ZNt3Y
+
+My first original project, trained with U-GAT-IT AdaIN-based image model (for some reason) on a 12GB GPU.
+Dataset was moderate-sized, quite noisy, and compute time was moderate.
+Used some new techniques to minimize background noise.
+The results are convincing some of the time.
+
+What do you think of the quality of the generated voice?
+How would you approach this project, given similar constraints?
+
+
+https://www.reddit.com/r/IndieFolk/
+
+
+https://www.reddit.com/r/indie_rock/
+Man of the People - ft. voice of Leonard Cohen
+
+
+https://www.reddit.com/r/AlbumArtPorn/
+Melogan - Man of the People [OC]
+
+
+https://www.reddit.com/r/CanadianMusic/
+
+
+https://www.reddit.com/r/Songwriters/
+A song for our time - Man of the People ft. "Leonard Cohen"
