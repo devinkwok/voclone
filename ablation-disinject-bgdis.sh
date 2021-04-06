@@ -4,8 +4,8 @@ python main.py \
     --num_workers=1 \
     --light=False \
     --dataset=cohen160-with-interview \
-    --iteration=600000 \
-    --print_freq=1000 \
+    --iteration=400000 \
+    --print_freq=5000 \
     --save_freq=5000 \
     --ch=64 \
     --n_res=4 \
@@ -35,7 +35,7 @@ python main.py \
     --scale_source_volume_noise=0.1 \
     --scale_target_volume_noise=0.25 \
     --noise_margin=0.02 \
-    --noise_weight_A=20. \
+    --noise_weight_A=5. \
     --noise_weight_B=1. \
     --w_sin_freq_A=1.5 \
     --h_sin_freq_A=3. \

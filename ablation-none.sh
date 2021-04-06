@@ -4,8 +4,8 @@ python main.py \
     --num_workers=1 \
     --light=False \
     --dataset=cohen160-with-interview \
-    --iteration=600000 \
-    --print_freq=1000 \
+    --iteration=400000 \
+    --print_freq=5000 \
     --save_freq=5000 \
     --ch=64 \
     --n_res=4 \

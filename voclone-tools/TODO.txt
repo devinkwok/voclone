@@ -4,20 +4,22 @@ ImageFolder does NOT recompute transforms for every epoch, so data augmentation 
 
 
 Competing approaches:
-    https://github.com/marcoppasini/MelGAN-VC/blob/master/MelGAN_VC.ipynb
-        this is basically TravelGAN?
-        definitely train this
+    (done)
+        https://github.com/marcoppasini/MelGAN-VC/blob/master/MelGAN_VC.ipynb
+            this is basically TravelGAN?
+            definitely train this
+        https://arxiv.org/pdf/1910.11997.pdf
+            this is Tacotron2 with rhythm/pitch adaptation, but the naturalness shouldn't be as good because it is conditioned on text input, not audio
+            doesn't work for my use case since I really do need style transfer to keep source's inflections
+        http://www.kecl.ntt.co.jp/people/kaneko.takuhiro/projects/stargan-vc2/index.html
+            original StarGAN paper is well cited, seems SOTA
+            this focus is on multi domain conversion - it is likely the quality will be worse than 1 to 1 transfer
+
     https://github.com/Yolanda-Gao/VoiceGANmodel
         this sounds worse than the above
-    https://arxiv.org/pdf/1910.11997.pdf
-        this is Tacotron2 with rhythm/pitch adaptation, but the naturalness shouldn't be as good because it is conditioned on text input, not audio
-        doesn't work for my use case since I really do need style transfer to keep source's inflections
     https://arxiv.org/abs/2005.09178
         all of this 1st author's audio samples are suspiciously good, and no code is available
         need to investigate further https://github.com/liusongxiang
-    http://www.kecl.ntt.co.jp/people/kaneko.takuhiro/projects/stargan-vc2/index.html
-        original StarGAN paper is well cited, seems SOTA
-        this focus is on multi domain conversion - it is likely the quality will be worse than 1 to 1 transfer
     https://openreview.net/forum?id=HJlk-eHFwH
         AdaGAN is closest to U-GAT-IT, not sure how good the samples sound
         was rejected by ICLR 2020
